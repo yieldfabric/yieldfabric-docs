@@ -46,10 +46,15 @@ to a design.
 | RAG / reasoning inside your OpenAI SDK calls | `/v1/chat/completions` + `extra_body={"yf": {working_group_id, kg_id, builtin_tools}}` |
 | "ChatGPT in my app" — one user, one assistant, streaming | `POST /chat` with `Accept: text/event-stream` |
 | A stateless LLM call (you own prompt + history) | `POST /chat` with `skip_rag: true`, `reasoning: false` (or `/v1/chat/completions`) |
-| Answers grounded in the user's documents / KG | `POST /chat` with `kg_id` or `working_group_id` |
+| Answers grounded in the user's documents / KG (chat-shaped) | `POST /chat` with `kg_id` or `working_group_id` |
+| **Just retrieve** passages + citations for a query, no chat wrapper | `POST /knowledge/documents/query` — tune `top_k` / `top_n` / `use_hyde` |
+| Retrieve scoped to one working group (optionally fan out to federation-granted groups) | `POST /working-groups/{id}/query` (add `include_federated: true` for cross-group) |
 | Multi-party chat where named agents participate | Working-group threads + `GET /working-groups/{id}/chat/stream` |
 | A team of agents reasoning over a hard problem | `POST /pipelines/run` (`kind: "reasoning"`) + events SSE |
 | Token usage for billing / quotas | `GET /api/usage/summary`, `GET /api/usage/detail` |
+| Live "all my LLM usage" rollup (every surface, counts errors) | `GET /api/usage/aggregate` |
+| What was actually sent/received on one call | `GET /api/usage/calls/{id}/log` |
+| Which API version a deployment serves (no credential needed) | `GET /version` |
 
 ## Authentication
 
@@ -69,6 +74,28 @@ also accept the token as a query parameter —
 `?access_token=<JWT>` — because the browser `EventSource` API
 cannot set headers. `POST /chat` streams over a regular `fetch`
 response body, so the normal `Authorization` header works there.
+
+## Discovering the served version — `GET /version`
+
+Before you hold a credential, confirm which API version a deployment
+actually serves. `GET /version` is **unauthenticated** (sibling to
+`/health`; no JWT) and returns the build identity:
+
+```bash
+curl https://agents.yieldfabric.com/version
+# → { "service": "yieldfabric-agents",
+#     "api_version": "0.12.1",       # baked from this spec's info.version at build time
+#     "git_sha": "e45bea7b3a30",     # short build commit, "unknown" without a repo/CI SHA
+#     "built_at": "2026-06-14T10:42:33Z" }
+```
+
+`api_version` is compile-time-baked from the agents OpenAPI spec's
+`info.version`, so a running deployment **cannot report a version it
+doesn't implement** — one request tells you whether a server has the
+surface you depend on (`/v1`, model selection, the usage rollup, …),
+instead of probing routes for feature presence. The auth (`:3000`)
+and payments (`:3002`) services expose the identical contract (with
+their own `service` name and spec version) for the same reason.
 
 ## Direct chat: `POST /chat`
 
@@ -217,6 +244,52 @@ Calls are metered per entity like everything else (feature labels
 the response's `usage`), so your YF usage reporting covers SDK
 traffic too.
 
+The open-source `examples/yieldfabric-chat` reference app demonstrates
+this surface end to end in its **Tools** tab — the standard
+tool-calling agent loop (`tools` / `tool_choice` / `tool_calls`),
+browser-executed tools, and the `yf` extension (workspace grounding +
+the server-side `rag_search` builtin), with each step of the loop
+rendered as it runs.
+
+## Retrieve-only RAG (no chat wrapper)
+
+When you want retrieval as a primitive — passages, citations, and a
+synthesized answer, without the assistant/thread machinery of `/chat` —
+call the RAG endpoint directly:
+
+```bash
+# Global document scope. The `answer` is synthesized from the retrieved
+# passages; `citations` map claims back to source chunks.
+curl -X POST "https://agents.yieldfabric.com/knowledge/documents/query" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"query": "What are the covenant thresholds?",
+       "top_k": 20, "top_n": 6, "use_hyde": true}'
+# → { "answer", "citations", "confidence",
+#     "chunks_retrieved", "graph_nodes_traversed", "strategy_used" }
+```
+
+Scope it to one working group (and, optionally, the groups that have
+granted it federation access) instead of the global corpus:
+
+```bash
+curl -X POST "https://agents.yieldfabric.com/working-groups/$WG_ID/query" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"query": "What are the covenant thresholds?",
+       "include_federated": true, "federated_rerank_top_n": 3}'
+# → { "answer", "confidence", "retrieval_quality", "citations",
+#     "chunks_retrieved", "strategy_used",
+#     "federated_sources": [ { "group_id", "chunks_retrieved" } ] }
+```
+
+`include_federated` (default `false`) merges citations from
+federation-granting groups; `federated_rerank_top_n` (default `3`) caps
+how many reranked passages each federated group contributes. The
+dedicated `POST /working-groups/{id}/query/federated` route is the
+always-federated equivalent (kept for back-compat).
+
+The `citations` these return are the same provenance objects the chat /
+`yf` paths surface — explore them with the frame endpoints below.
+
 ## Going deeper: from citation to frame
 
 Everything the `yf` extension returns is backed by the **frame
@@ -317,6 +390,50 @@ The run also writes its narrative into a dedicated `reasoning`
 thread (`thread_id` from step 1) — fetch it with
 `GET /working-groups/{id}/threads/{tid}/messages` if you want the
 agent-by-agent transcript rather than a synthesis.
+
+> **Two distinct "pause" mechanisms** (easy to conflate). Reasoning
+> and ingestion pause *alive*: the SSE stream emits
+> `waiting_for_input` (this is what team formation and vocab review
+> use) and stays open — answer with `POST /pipelines/{run_id}/input`
+> (`{kind: "proceed" | "guidance" | "done" | "cancel"}`) and it
+> continues. The separate `pipeline_checkpoint`
+> (`requires_user_action: true`) event *terminates* the run at an
+> explicit `Checkpoint` step — continued with
+> `POST /pipelines/{run_id}/resume` (no body) and a re-opened stream.
+> The public reasoning/ingest pipelines don't contain `Checkpoint`
+> steps, so in practice you'll see `waiting_for_input` → `/input`.
+
+## File to knowledge graph
+
+Turn a document into queryable knowledge in one upload. `POST
+/pipelines/ingest-document-upload` is multipart — send the file as
+field `file` (text or PDF; the server base64-handles PDFs), plus an
+optional `working_group_id` (and `target_kg_id` to add to an
+existing KG). **The server does everything**: chunking, embedding,
+and extracting typed frames. It returns the same
+`{run_id, kg_id}` as a reasoning run, streams ingestion progress
+over the same `GET /pipelines/{run_id}/events` SSE, and lands a
+knowledge graph.
+
+```bash
+curl -X POST "https://agents.yieldfabric.com/pipelines/ingest-document-upload" \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@contract.pdf" \
+  -F "working_group_id=$WG_ID"
+# → { "run_id": "…", "kg_id": "…" }
+```
+
+Then read what it built — `GET /kgs/{kg_id}/summary` (frame counts
++ lexicon) and `GET /kgs/{kg_id}/frames` (the typed nodes) — and
+ground chat or reasoning against `kg_id`. One caveat: `GET /kgs`
+lists only KGs scoped to a working group you belong to, so an
+ungrouped ingest's KG won't appear there (you still have its
+`kg_id` from the response and can open it directly).
+
+Both of these flows — reasoning and file→KG — ship as runnable
+tabs in the open-source `examples/yieldfabric-chat` reference app
+(**Reasoning** and **Knowledge**), sharing one pipeline-events
+service and KG viewer.
 
 ### Response modes
 
@@ -513,6 +630,35 @@ one row per user message, with the per-call breakdown inside —
 exactly what a token-usage UI needs. The open-source
 `examples/yieldfabric-chat` reference app ships a usage drawer
 built this way.
+
+**Per-call audit**: each detail row's `id` is a `usage_event_id`
+that opens `GET /api/usage/calls/{usage_event_id}/log` — the exact
+prompt messages and output persisted for that call (ownership-scoped
+per event, so non-staff only open their own; 404 when call logging
+is disabled or the row aged out of its retention window, 30 days by
+default, both governed by the deployment's `call_log_enabled`
+setting). Token numbers tell you *how much*; this tells you *what
+was actually sent and received*. **Streaming chat completions are
+now audited too** — previously only non-streaming
+`complete` / structured / tool calls produced a transcript, so a
+streamed answer (every default chat reply) showed "no log for this
+call"; the streaming path now records the accumulated output at
+stream end, in parity with the buffered methods. **Embeddings are
+intentionally logless** — they meter (token counts, latency) but
+carry no prompt/output transcript, so the audit endpoint returns
+404 for an embedding event by design, not as an error.
+
+**Everything, in one query**: `GET /api/usage/aggregate` is a live
+rollup of the raw `llm_usage` table grouped by `(feature, model)`
+over a date window — per-group calls, token sums, `error_count`,
+and `avg_latency_ms` plus overall `totals`. Unlike the daily
+`summary` (which lags the rollup and drops failures), it's
+up-to-the-second, counts errors, and spans **every** surface the
+caller used in one shot — chat, `/v1` (`compat_chat` /
+`compat_embed`), RAG, workflows. It's what a unified "all my LLM
+usage" dashboard reads. Note that the stateless `/v1` surface
+carries no `thread_id`, so its traffic shows up here and in
+`summary`, but not in a thread-scoped `detail?thread_id=…` view.
 
 > Scoping: staff roles (SuperAdmin/Admin/Manager/Operator) and
 > service tokens may filter arbitrarily, including the org-wide

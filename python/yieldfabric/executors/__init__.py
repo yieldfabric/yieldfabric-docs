@@ -5,6 +5,7 @@ Command executors for YieldFabric.
 from .assert_executor import AssertExecutor
 from .base import BaseExecutor
 from .composed_executor import ComposedExecutor
+from .deal_executor import DealExecutor
 from .group_admin_executor import GroupAdminExecutor
 from .obligation_executor import ObligationExecutor
 from .payment_executor import PaymentExecutor
@@ -20,6 +21,7 @@ __all__ = [
     "AssertExecutor",
     "BaseExecutor",
     "ComposedExecutor",
+    "DealExecutor",
     "GroupAdminExecutor",
     "ObligationExecutor",
     "PaymentExecutor",

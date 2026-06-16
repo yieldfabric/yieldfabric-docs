@@ -136,11 +136,14 @@ class PolicyExecutor(BaseExecutor):
         default_wallet_id = self._claim(token, "default_wallet_id")
         sub = get_sub(token)
 
-        # Fallback: a deployed group's account address via account-status when
-        # the delegation claim didn't carry it.
-        if command.user.group and not group_account_address:
+        # Resolve the acting group's UUID whenever a group context is given —
+        # callers that mint a group delegation (e.g. loan-collect arming) need it.
+        # Also doubles as the fallback for a group account address the delegation
+        # claim didn't carry.
+        group_id = None
+        if command.user.group:
             group_id = self.auth_service.get_user_group_id_by_name(token, command.user.group)
-            if group_id:
+            if group_id and not group_account_address:
                 info = self.auth_service.group_account_info(token, group_id)
                 group_account_address = info.get("account_address") or None
                 default_wallet_id = default_wallet_id or info.get("wallet_id")
@@ -148,6 +151,8 @@ class PolicyExecutor(BaseExecutor):
         outputs = {
             "account_address": account_address,
             "group_account_address": group_account_address,
+            # The acting group's UUID (for callers that mint a group delegation).
+            "group_id": group_id,
             # Lowercased variants for case-robust on-chain address comparisons
             # (on-chain reads come back in mixed case).
             "account_address_lc": (account_address or "").lower() or None,
@@ -223,6 +228,13 @@ class PolicyExecutor(BaseExecutor):
             gql_input["callerIds"] = [str(c) for c in p.get("caller_ids")]
         if p.get("executor_accounts"):
             gql_input["executorAccounts"] = list(p.get("executor_accounts"))
+        # #B NFT-holder executor: the per-executor token id, parallel to executor_accounts.
+        # Omitting this leaves executors_id defaulting to "0" server-side, which makes the
+        # slot an ADDRESS executor (the collection address) rather than an NFT slot — so the
+        # off-chain ownerOf gate (valid_nft_executor_slots) finds nothing and denies. Must be
+        # threaded for the agency-NFT model to work.
+        if p.get("executor_ids"):
+            gql_input["executorIds"] = [str(e) for e in p.get("executor_ids")]
         if p.get("required_signer_entity_ids"):
             gql_input["requiredSignerEntityIds"] = list(p.get("required_signer_entity_ids"))
         if p.get("amount_bounds"):
@@ -234,6 +246,7 @@ class PolicyExecutor(BaseExecutor):
             "min_signatories": gql_input["minSignatories"],
             "required_signers": required_signers,
             "executor_accounts": p.get("executor_accounts"),
+            "executor_ids": p.get("executor_ids"),
             "allowed_operations": allowed_operations,
             "max_use": gql_input["maxUse"],
             "expiry": gql_input["expiry"],

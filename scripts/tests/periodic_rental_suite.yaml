@@ -1,0 +1,442 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  PERIODIC RENTAL — the unattended deal-lifecycle clock, end to end
+# ════════════════════════════════════════════════════════════════════════════
+#
+#  Validates the periodic-deal engine for a RENTAL (Model A — a simplified
+#  loan: a fixed recurring payment, NO obligation/escrow):
+#
+#    landlord proposes a periodic rental deal (raw DealPlan) → tenant signs →
+#    activate seeds one deal_periods row per rent date → tenant arms AUTO-PAY
+#    with an API key they control → the leader-elected deal_period_scheduler
+#    fires each due period under the tenant's exchanged JWT → rent lands in the
+#    PROPERTY ACCOUNT (the group created at setup) → the period flips COMPLETED.
+#
+#  This is the live counterpart to `frozen_templates_round_trip.rs` (which only
+#  validates the plan STATICALLY): it exercises the pieces that only run live —
+#  the scheduler firing, the credential exchange, `register_onchain_pipeline`
+#  under the exchanged JWT, the setup-output resolution
+#  (`$step.create_property.group_wallet_id`), and the period-completion mirror.
+#
+#  ──────────────────────────────────────────────────────────────────────────
+#  HARNESS: runnable as-is via the Python harness (`yieldfabric-docs/python`).
+#  The deal layer is wired in:
+#    • `AgentsService` (yieldfabric/services/agents_service.py) — POST
+#      `<agents_url>/graphql`; the deal GraphQL (`dealFlow { … }`) is on
+#      agents (:3001), NOT payments (:3002).
+#    • `DealExecutor` (yieldfabric/executors/deal_executor.py) — dispatches
+#      the deal command types below to the `dealFlow` mutations/queries:
+#         propose_deal           → dealFlow { proposeDeal(input) { deal{id status} } }
+#         sign_deal              → dealFlow { signDeal(input)   { deal{id status} } }
+#         set_automation_key     → POST /auth/api-key/generate (caller mints a
+#                                  yf_api_… key) then
+#                                  dealFlow { setDealAutomationKey(input{ dealId apiKey keyLabel }) { active … } }
+#         revoke_automation_key  → dealFlow { revokeDealAutomationKey(input{ dealId }) { active } }
+#         deal_automation_status → dealFlow { dealAutomationStatus(dealId) { active entityId } }
+#         deal_periods           → dealFlow { dealPeriods(dealId) { periodIndex status … } }
+#
+#  REQUIREMENTS to run:
+#    • All three services up: auth (:3000), payments (:3002), agents (:3001).
+#      The deal-flow + the `deal_period_scheduler` live in agents.
+#    • Env: AUTH_SERVICE_URL, PAY_SERVICE_URL, AGENTS_SERVICE_URL (defaults
+#      localhost:3000/3002/3001). Parties seeded via setup.yaml.
+#    • Run (from yieldfabric-docs/python):
+#        PYTHONPATH=. python -m yieldfabric.cli execute \
+#          ../scripts/tests/periodic_rental_suite.yaml
+#      or:  make execute FILE=../scripts/tests/periodic_rental_suite.yaml
+#
+#  ⚠️  TIMING MODEL (load-bearing): the scheduler scans
+#  `deal_periods WHERE due_at <= NOW()` on the WALL CLOCK
+#  (`chrono::Utc::now()`), NOT chain time. So:
+#    - `advance_chain_time` does NOT trigger the scheduler (it moves the chain's
+#      block.timestamp; the scheduler ignores it). It IS still needed if a
+#      period carries a vesting/locked payment — rent's `instant_send` is
+#      immediate, so this suite needs none.
+#    - To make a period fire NOW, its `due_at` must be in the PAST. The plan
+#      below sets `schedule.start_at` to 7 days ago via `$(date)`, so periods 0+
+#      are already due. After activate + arm-key, the suite SLEEPS past one
+#      scheduler tick (60s interval + 60s startup stagger ⇒ wait ~150s).
+#
+#  PARTIES (seeded SuperAdmins; see setup.yaml):
+#    originator@yieldfabric.com — LANDLORD (proposer; owns the property account)
+#    payer@yieldfabric.com      — TENANT  (pays rent; arms + owns the auto-pay key)
+#
+#  AMOUNTS: rent 1000 AUD/period; tenant funded 12000 AUD (covers 12 periods).
+# ════════════════════════════════════════════════════════════════════════════
+
+commands:
+
+  # ───────────────────────── IDENTITY ─────────────────────────
+  - name: landlord_ctx
+    type: whoami
+    user: { id: originator@yieldfabric.com, password: originator_password }
+
+  - name: tenant_ctx
+    type: whoami
+    user: { id: payer@yieldfabric.com, password: payer_password }
+
+  # ───────────────────────── FUNDING ─────────────────────────
+  # The tenant pays rent each period from their own confidential AUD balance.
+  - name: fund_tenant
+    type: deposit
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      asset_id: aud-token-asset
+      amount: 12000000000000000000000
+      idempotency_key: periodic-rental-fund-$(date +%s | tee /tmp/yf_periodic_rental_nonce)
+
+  # ═══════════════ 1 — LANDLORD PROPOSES THE RENTAL DEAL ═══════════════
+  # Raw DealPlan (proposeDeal accepts `plan: serde_json::Value` directly —
+  # ProposeDealInput.plan, validated server-side against the registry). The
+  # plan: a `create_property` setup node (the property GROUP account) + a
+  # periodic_template paying fixed rent to that account's wallet each period.
+  #
+  # `start_at` is 7 DAYS AGO so periods are immediately due (see TIMING MODEL).
+  # `counterpart`/parties: the tenant signs; the landlord (proposer) auto-signs.
+  - name: propose_rental
+    type: propose_deal
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      name: "12 Smith St — Periodic Lease"
+      parties:
+        - { entity_id: $tenant_ctx.user_id, role: tenant }
+      idempotency_key: periodic-rental-propose-$(cat /tmp/yf_periodic_rental_nonce)
+      plan:
+        entry_step_ids: [create_property]
+        cashflow_ref: null
+        agreement_metadata:
+          governing_law: "New South Wales"
+          jurisdiction: "Sydney, Australia"
+          platform_terms_version: "1.0.0"
+        nodes:
+          - step_id: create_property
+            task_name: create_group_account
+            inputs:
+              name: "12 Smith St — Property Account $(cat /tmp/yf_periodic_rental_nonce)"
+              group_type: "custom"
+              description: "Property account that collects rent each period."
+            assignee_override: { kind: proposer }
+        edges: []
+        periodic_template:
+          schedule:
+            kind: interval
+            start_at: "$(date -u -v-7d +%Y-%m-%dT%H:%M:%SZ)"
+            interval_days: 30
+            count: 12
+          per_period_entry_step_ids: [pay_rent]
+          per_period_actions:
+            - step_id: pay_rent
+              task_name: instant_send
+              inputs:
+                asset_id: aud-token-asset
+                amount: "1000"
+                destination_wallet_id: "$step.create_property.group_wallet_id"
+              assignee_override: { kind: party, role: tenant }
+          per_period_edges: []
+
+  - name: assert_deal_proposed
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      actual: "$propose_rental.deal_id"
+      contains: "DEAL"
+
+  # ═══════════════ 2 — TENANT SIGNS → ACTIVATE → SEED PERIODS ═══════════════
+  # The proposer auto-signs at propose; the tenant's signature is the last,
+  # flipping the deal Proposed → Active. activate seeds one SCHEDULED
+  # deal_periods row per period (12), each with its due_at from the schedule,
+  # and starts the parent setup workflow — but its `create_property` step
+  # DEFERS to the landlord's inbox (per-step consent, see 2b below); it does
+  # not deploy until the landlord executes it.
+  - name: tenant_sign
+    type: sign_deal
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+
+  - name: assert_deal_active
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      # GraphQL serialises DealStatus in SCREAMING form — ACTIVE, not Active.
+      actual: "$tenant_sign.status"
+      equals: "ACTIVE"
+
+  # ═══════════ 2b — LANDLORD EXECUTES THE SETUP STEP (per-step consent) ═══════════
+  # The setup node `create_property` (create_group_account, assignee = the
+  # landlord/proposer) is an on-chain payment step, so the working-group runtime
+  # DEFERS it to the landlord's inbox awaiting their explicit /execute — it does
+  # NOT auto-run at activation (the per-step consent gate: a payment step with a
+  # named human assignee always defers). The landlord drives it here — deploying
+  # their own property account is a legitimate one-time consent. `execute_step`
+  # polls for the deferred step's pending action (carrying its group/workflow
+  # ids), then POSTs .../steps/create_property/execute as the landlord.
+  # (The RECURRING rent is driven UNATTENDED by the scheduler under the tenant's
+  # auto-pay credential — no human /execute per period.)
+  - name: landlord_execute_setup
+    type: execute_step
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+      step_id: create_property
+      find_timeout: 90
+
+  # Give create_property's on-chain deploy time to settle (create_group_account
+  # polls the deploy ~90s) so `group_wallet_id` resolves when the scheduler
+  # materialises a period. Until it completes, the scheduler's period-fire
+  # retries fail materialize and back off — harmless, they re-attempt each tick.
+  - name: await_setup_deploy
+    type: sleep
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { seconds: 120 }
+
+  # ═══════════ KILL-SWITCH GATING PROOF (genuine, non-flaky) ═══════════
+  # Period 0 has been DUE since activation (start_at 7d ago), and the 120s wait
+  # above spanned ~2 scheduler ticks — yet NO credential is armed yet. The
+  # scheduler reads ONLY active credentials (fire_period bails at
+  # get_active_credential before doing anything), so period 0 must still be
+  # SCHEDULED here. This proves the credential gate that makes `revoke` a real
+  # kill-switch: no active credential ⇒ a due period does NOT fire. (Genuine
+  # firing-stop can't use "back-date period 1 then revoke" — the scheduler
+  # batch-fires all due periods in one tick, so 0 and 1 would fire together;
+  # this gating proof + the post-run revoke→active=False below compose to the
+  # same guarantee.)
+  - name: periods_unarmed
+    type: deal_periods
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+
+  - name: assert_period_0_not_fired_without_credential
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      actual: "$periods_unarmed.period_0_status"
+      equals: "SCHEDULED"
+
+  # Snapshot the tenant's confidential AUD BEFORE auto-pay fires, so the
+  # post-fire check is a DELTA (−1 rent), not an absolute balance — robust to
+  # prior balance and to re-runs on a dirty stack (every run funds 12000 anew
+  # and mints a fresh deal, so the absolute balance grows run-over-run).
+  - name: tenant_balance_before
+    type: balance
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { asset_id: aud-token-asset }
+
+  # ═══════════════ 3 — TENANT ARMS AUTO-PAY (owns the key) ═══════════════
+  # The TENANT (the payer) mints a yf_api_… key in their OWN session and hands
+  # it to the deal's auto-pay credential — sealed server-side, scoped to their
+  # own entity. The scheduler exchanges it for an account-bearing JWT to fire
+  # the tenant's rent payment each period. (`set_automation_key` does the
+  # POST /auth/api-key/generate + setDealAutomationKey under the hood.)
+  - name: arm_autopay
+    type: set_automation_key
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+      key_label: "rent-autopay"
+
+  - name: autopay_status
+    type: deal_automation_status
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+
+  - name: assert_autopay_active
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      actual: "$autopay_status.active"
+      equals: "True"
+
+  # ═══════════════ 4+5 — THE CLOCK FIRES → POLL period 0 to COMPLETED ═══════════════
+  # Periods 0+ are due (start_at 7d ago). Each scheduler tick (60s) that wins
+  # leadership: exchanges the tenant's auto-pay key → processDealPeriod
+  # (materialises the period child workflow, resolving
+  # $step.create_property.group_wallet_id) → DRIVES /execute for the deferred
+  # rent step under the tenant's exchanged JWT → instant_send settles on-chain →
+  # the deal-events mirror marks the period COMPLETED while the deal stays Active.
+  #
+  # POLL (not a fixed sleep): the time-to-fire is variable — it depends on the
+  # scheduler winning the leader lock (the shared leader_election currently
+  # leaks its pg advisory lock onto a pooled connection, so leadership is ~1/N
+  # ticks until that connection is reused → firing can lag several minutes after
+  # a fresh agents restart) plus the on-chain settle. So `periods_after` polls
+  # dealPeriods until period 0 is COMPLETED (up to 8 min), instead of betting a
+  # fixed sleep lands after the fire. A genuine stall surfaces as a clear
+  # "still SCHEDULED after Ns", not a bare assert mismatch.
+  - name: periods_after
+    type: deal_periods
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+      wait_for_status: COMPLETED
+      wait_period_index: 0
+      wait_timeout: 480
+      wait_interval: 5
+
+  - name: assert_period_0_completed
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      # The `deal_periods` command surfaces per-period status; assert period 0
+      # reached COMPLETED (the scheduler fired it and the mirror closed it).
+      actual: "$periods_after.period_0_status"
+      equals: "COMPLETED"
+
+  # INTEGRITY: COMPLETED alone could be a status flip without execution. Prove
+  # the period actually fired a real child workflow (workflow_id stamped) AND
+  # the deal_events mirror recorded the realised roll-forward (has_realised).
+  - name: assert_period_0_ran_workflow
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      # The child period workflow id (a UUID, so it contains '-') — proof
+      # processDealPeriod materialised + STARTED a real sub-workflow, not just a
+      # DB status flip with no on-chain execution behind it.
+      actual: "$periods_after.period_0_workflow_id"
+      contains: "-"
+
+  - name: assert_period_0_realised
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      # The mirror ran mark_completed_async(realised := projected). For this
+      # literal-amount rental (cashflow_ref: null) the realised value is EMPTY
+      # (no cashflow engine) — so this asserts the roll-forward EXECUTED, not its
+      # contents. (On the loan/cashflow path it carries the realised numbers.)
+      actual: "$periods_after.period_0_has_realised"
+      equals: "True"
+
+  # The tenant's confidential AUD fell by exactly one rent (1000) — proof the
+  # scheduler moved real money, once, under the tenant's auto-pay key.
+  - name: tenant_balance_after
+    type: balance
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { asset_id: aud-token-asset }
+
+  - name: assert_one_rent_paid
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      # DELTA assert (after − before): the scheduler moved exactly ONE rent
+      # under the tenant's auto-pay key, so the confidential AUD fell by
+      # exactly 1000. Robust to prior balance / re-runs (the absolute value
+      # grows each run; the delta does not).
+      # UNITS: the deal-layer `instant_send` rent is HUMAN ("1000"), scaled by
+      # the payment bridge to 1000 × 1e18 wei — same convention the frozen
+      # loan template uses (`"amount": 100000`). `private_balance` is raw wei,
+      # so the delta is −1000e18 exactly. (If a live run shows the rent did NOT
+      # scale — delta off by 1e18 — the deal-period instant_send bypassed the
+      # bridge scaler; fix there, don't paper over it by changing this value.)
+      actual: "$tenant_balance_after.private_balance"
+      minus:  "$tenant_balance_before.private_balance"
+      equals: "-1000000000000000000000"
+
+  # ───────── PROPERTY ACCOUNT RECEIVED THE RENT (closes the payee blind spot) ─────────
+  # The tenant-side −1000 proves money LEFT the tenant, NOT where it went. Verify
+  # the rent actually landed in the PROPERTY ACCOUNT: the landlord acts AS the
+  # property group (created at setup, the rent's $step.create_property.group_wallet_id
+  # destination) and reads its confidential AUD. The property group is fresh each
+  # run (nonce-named), so it starts at 0 and holds exactly one rent (1000) after
+  # the scheduler fires. (Requires the runner to substitute user.group — added.)
+  - name: property_ctx
+    type: whoami
+    user:
+      id: originator@yieldfabric.com
+      password: originator_password
+      group: "12 Smith St — Property Account $(cat /tmp/yf_periodic_rental_nonce)"
+
+  - name: assert_property_account_real
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      # The property group resolved to a REAL deployed on-chain account (a 0x
+      # address) — the rent's destination is a genuine distinct account, not a
+      # zero/empty fallback that the tenant-side delta alone couldn't catch.
+      actual: "$property_ctx.group_account_address"
+      contains: "0x"
+
+  # The property group must ACCEPT the incoming confidential rent before it
+  # appears in private_balance. A confidential `instant`/send only debits the
+  # PAYER and writes the recipient a PENDING payable (surfaced separately as
+  # `locked_in`, never summed into private_balance); the recipient's on-chain
+  # `privateBalances` slot is written ONLY by `accept` — and that write is
+  # msg.sender-keyed (ConfidentialVault._accept), so ONLY the recipient's own
+  # transaction can credit it. The property group pulls the rent via acceptAll
+  # (acting AS the group through its delegation JWT — the resolver scopes
+  # payables to the acting_as entity's wallets), and its private_balance then
+  # reflects the 1000. `wait_for_accept_all` submits + polls until the accept
+  # settles on-chain, so the balance read below is stable (not a race).
+  - name: property_accept_rent
+    type: wait_for_accept_all
+    user:
+      id: originator@yieldfabric.com
+      password: originator_password
+      group: "12 Smith St — Property Account $(cat /tmp/yf_periodic_rental_nonce)"
+    parameters:
+      asset_id: aud-token-asset
+      idempotency_key: periodic-rental-accept-$(cat /tmp/yf_periodic_rental_nonce)
+
+  # acceptAll returns as soon as the resolver ENQUEUES the on-chain accept (a
+  # MessageType::Retrieve MQ message) — acceptedCount=1 means "accepted at the
+  # resolver", NOT "settled on chain". The actual `accept` tx (which writes the
+  # group's privateBalances slot via the vault) settles asynchronously through
+  # the MQ executor. Without this wait the balance read races the settle and
+  # sees the rent still in `locked_in` (redeemed=0), private_balance=0. The SEND
+  # got its settle window from await_scheduler_fire (180s); the accept needs its
+  # own. Local hardhat settles a Retrieve in a few seconds; 30s is safe headroom.
+  - name: await_accept_settle
+    type: sleep
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters: { seconds: 30 }
+
+  - name: property_balance
+    type: balance
+    user:
+      id: originator@yieldfabric.com
+      password: originator_password
+      group: "12 Smith St — Property Account $(cat /tmp/yf_periodic_rental_nonce)"
+    parameters: { asset_id: aud-token-asset }
+
+  - name: assert_property_received_rent
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      # The property account holds EXACTLY one rent (1000 × 1e18) AFTER it
+      # accepts the incoming payment (property_accept_rent above). Fresh group
+      # per run ⇒ the absolute assert is safe. End-to-end receipt proof:
+      # tenant −1000 AND property +1000, same 1000.
+      # (Confirmed live 2026-06-14: a confidential `instant` is acceptance-gated
+      # for the RECIPIENT — private_balance stays 0 until the group runs
+      # acceptAll; before that the rent sits in `locked_in`, in flight not lost.)
+      actual: "$property_balance.private_balance"
+      equals: "1000000000000000000000"
+
+  # ⚠️  NOTE on back-dated periods: because start_at is 7d ago with 30d spacing,
+  # ONLY period 0 is due within the 7-day window — periods 1+ are still future
+  # (30d, 60d, … from start_at), so the scheduler fires exactly ONE period.
+  # That is the intended single-fire assertion above. To exercise multiple
+  # fires, set start_at further back (e.g. -65d) so periods 0,1,2 are all due,
+  # and adjust the balance assert to 12000 − N×1000.
+
+  # ═══════════════ 6 — KILL-SWITCH: revoke stops future fires ═══════════════
+  # The tenant stops auto-pay. The scheduler reads only ACTIVE credentials, so
+  # no further period fires (validated on a stack where a later period is due).
+  - name: stop_autopay
+    type: revoke_automation_key
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+
+  - name: autopay_status_after_revoke
+    type: deal_automation_status
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+
+  - name: assert_autopay_stopped
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      actual: "$autopay_status_after_revoke.active"
+      equals: "False"

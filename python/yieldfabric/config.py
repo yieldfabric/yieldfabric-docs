@@ -20,6 +20,12 @@ class YieldFabricConfig:
     auth_service_url: str = field(
         default_factory=lambda: os.getenv('AUTH_SERVICE_URL', 'http://localhost:3000')
     )
+    # Agents service hosts the federated deal-flow GraphQL (`dealFlow { … }`)
+    # at `<agents_url>/graphql` on :3001 — NOT the payments :3002 graphql.
+    # Deal-lifecycle commands (propose/sign/automation/periods) target it.
+    agents_service_url: str = field(
+        default_factory=lambda: os.getenv('AGENTS_SERVICE_URL', 'http://localhost:3001')
+    )
 
     # API key for backend-service authentication (preferred over
     # email/password for non-interactive callers like setup). When set,
@@ -105,6 +111,7 @@ class YieldFabricConfig:
         return cls(
             pay_service_url=config_dict.get('pay_service_url', defaults.pay_service_url),
             auth_service_url=config_dict.get('auth_service_url', defaults.auth_service_url),
+            agents_service_url=config_dict.get('agents_service_url', defaults.agents_service_url),
             api_key=config_dict.get('api_key', defaults.api_key),
             command_delay=config_dict.get('command_delay', defaults.command_delay),
             debug=config_dict.get('debug', defaults.debug),
@@ -119,6 +126,7 @@ class YieldFabricConfig:
         return {
             'pay_service_url': self.pay_service_url,
             'auth_service_url': self.auth_service_url,
+            'agents_service_url': self.agents_service_url,
             'api_key': self.api_key,
             'command_delay': self.command_delay,
             'debug': self.debug,

@@ -94,6 +94,7 @@ class ObligationExecutor(BaseExecutor):
         outputs = {
             "account_address": data.get("accountAddress"),
             "contract_id": data.get("contractId"),
+            "token_id": data.get("tokenId"),
             "transaction_id": data.get("transactionId"),
             "message": data.get("message"),
             "message_id": data.get("messageId"),

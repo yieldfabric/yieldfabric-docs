@@ -49,6 +49,8 @@ Environment Variables (also read from ./.env, or --env-file):
                       JWT via POST /auth/api-key at boot.
   PAY_SERVICE_URL     Payments service URL (default: http://localhost:3002)
   AUTH_SERVICE_URL    Auth service URL    (default: http://localhost:3000)
+  AGENTS_SERVICE_URL  Agents service URL  (default: http://localhost:3001) —
+                      hosts the deal-flow GraphQL used by deal-lifecycle commands
   COMMAND_DELAY       Delay between commands in seconds (default: 0)
   DEBUG               Enable debug logging (default: false)
         """,
@@ -78,6 +80,10 @@ Environment Variables (also read from ./.env, or --env-file):
     parser.add_argument("--debug", action="store_true", help="enable debug logging")
     parser.add_argument("--pay-service-url", help="override payments service URL")
     parser.add_argument("--auth-service-url", help="override auth service URL")
+    parser.add_argument(
+        "--agents-service-url",
+        help="override agents service URL (deal-flow GraphQL; default :3001)",
+    )
     parser.add_argument(
         "--api-key",
         help="backend-service API key (yf_api_…); overrides API_KEY env",
@@ -132,6 +138,8 @@ def _apply_overrides(config: YieldFabricConfig, args: argparse.Namespace):
         config.pay_service_url = args.pay_service_url
     if args.auth_service_url:
         config.auth_service_url = args.auth_service_url
+    if args.agents_service_url:
+        config.agents_service_url = args.agents_service_url
     if args.command_delay:
         config.command_delay = args.command_delay
     if args.api_key:

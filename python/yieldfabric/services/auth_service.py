@@ -155,6 +155,43 @@ class AuthService(BaseServiceClient):
             self.logger.error(f"    ❌ API-key authentication failed: {e}")
             return None
 
+    def generate_api_key(
+        self,
+        token: str,
+        *,
+        service_name: str,
+        description: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Mint a `yf_api_…` key for the caller via
+        POST /auth/api-key/generate (authenticated with the caller's own
+        user JWT). The returned key is owned by the caller's entity — so a
+        payer minting a key here gets one scoped to themselves, which is
+        exactly what `setDealAutomationKey` needs (the scheduler later
+        exchanges it for an account-bearing JWT to fire the payer's
+        periods).
+
+        Returns the `yf_api_…` secret, or None on failure. The secret is
+        shown ONCE here; the caller hands it straight to the credential
+        store and never persists it client-side.
+        """
+        self.logger.info(f"  🔑 generate_api_key service={service_name}")
+        payload: dict = {"service_name": service_name}
+        if description is not None:
+            payload["description"] = description
+        try:
+            response = self._post("/auth/api-key/generate", payload, token=token)
+            data = response.json()
+            api_key = data.get("api_key")
+            if api_key:
+                self.logger.success("    ✅ API key generated")
+                return api_key
+            self.logger.error("    ❌ No api_key in generate response")
+            return None
+        except Exception as e:
+            self.logger.error(f"    ❌ generate_api_key failed: {e}")
+            return None
+
     def get_groups(self, token: str) -> List[dict]:
         """
         Get list of groups for user.

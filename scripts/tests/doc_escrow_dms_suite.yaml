@@ -1,0 +1,312 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  DOCUMENT ESCROW — THROUGH THE DMS DEAL FLOW (propose → sign → execute_step)
+# ════════════════════════════════════════════════════════════════════════════
+#
+#  The DMS counterpart to doc_escrow_suite.yaml. That suite drives the SUBSTRATE
+#  verbs directly (commit_oracle_document / add_data_policy / execute_under_policy
+#  as standalone GraphQL on payments :3002). THIS suite drives the SAME escrow
+#  THROUGH THE DEAL DAG on the agents service (:3001 `dealFlow { … }`): a deal is
+#  proposed from an inline DealPlan, signed by both counterparties, then each
+#  on-chain step is executed by its assignee via `execute_step`. So it exercises
+#  the deal-task descriptors + payment-bridge arms this work added:
+#    • commit_oracle_document  (new deal task → pipelineGate.commitOracleDocument)
+#    • execute_under_policy     (new deal task → pipelineGate.executeUnderPolicy)
+#    • add_data_policy          (existing task, source-3 oracle requirement)
+#  and the cross-step ref `$step.register_release_policy.policy_id` — which only
+#  resolves because addDataPolicy now requests `policyId` and the bridge lift-loop
+#  captures it (the fix this work added). The release binds that policy_id.
+#
+#  MODEL (three deal parties; the doc-gated release driven through the DAG):
+#    G          = the ESCROW account — the payer's pre-existing group ("Issuer
+#                 Group"), FUNDED OUT-OF-BAND below (see WHY PRE-FUNDED).
+#    payer      = issuer (deal PROPOSER; owns G; registers the release policy —
+#                 and, being the registrar AND sole required signer, the policy
+#                 is auto-approved at registration, so there is NO approve step).
+#    beneficiary= collateral (deal party; the policy EXECUTOR; releases G→self).
+#    attestor   = investor (deal party; NEUTRAL certifier; commits the ZK
+#                 document at ITS OWN oracle slot — the requirement's `obligor`).
+#
+#  DEAL DAG (inline plan):  commit_attestation (attestor)
+#                                   │
+#                                   ▼
+#                           register_release_policy (payer)   ── source-3 oracle
+#                                   │                            requirement +
+#                                   ▼                            auto-approve
+#                           release_escrow (beneficiary)       ── executeUnderPolicy
+#                                                                 Send G→beneficiary
+#
+#  WHY PRE-FUNDED OUT-OF-BAND: getting spendable funds into a group needs a send
+#  + the group's accept_all (a confidential payment is PENDING until accepted —
+#  see doc_escrow_suite.yaml's escrow_accept). The `doc_escrow` template funds
+#  in-deal via instant_send but has no group-accept step, so funds would sit
+#  unspendable and the release would fail; that is a template gap to close
+#  separately. To keep THIS suite focused on the NEW deal tasks + the doc-gated
+#  release (not on the funding-accept mechanics), G is funded here via the proven
+#  deposit→instant→accept_all command path, and the deal runs commit→register→
+#  release on the already-spendable G. (create_group_account + instant_send as
+#  deal steps are existing tasks already proven in the rental/loan deal suites.)
+#
+#  ──────────────────────────────────────────────────────────────────────────
+#  ⚠️  UNVERIFIED — AUTHORED FROM SOURCE, NOT YET SMOKE-RUN. Areas to confirm on
+#  the first live run (each flagged inline):
+#    (A) PER-STEP DEFERRAL. All three nodes have named assignees, so each defers
+#        to its assignee's inbox and is driven by an explicit `execute_step`. If
+#        a step auto-advances instead, its execute_step finds no pending action
+#        and times out — that is the signal to drop it.
+#    (B) RELEASE EXECUTOR CONTEXT. The beneficiary executes release_escrow as
+#        itself; the on-chain executor gate checks msg.sender against the policy's
+#        executor_accounts (the beneficiary's wallet), so no group context should
+#        be needed. If the gate requires it, run that execute_step with
+#        `group: Issuer Group`.
+#    (C) SETTLE WAITS. commit must be persisted shared-at-rest before register
+#        derives the constraint from it; the release send must settle before the
+#        beneficiary accepts. The sleeps below are sized from the command-suite's
+#        observed settles (~6–15s); lengthen if a balance assert races.
+#
+#  REQUIREMENTS: all three services up — auth (:3000), payments (:3002), agents
+#  (:3001) running the build that includes the commit_oracle_document +
+#  execute_under_policy descriptors. Parties seeded (issuer/collateral/investor),
+#  collateral a member of Issuer Group. Run (from yieldfabric-docs/python):
+#    PYTHONPATH=. python -m yieldfabric.cli execute \
+#      ../scripts/tests/doc_escrow_dms_suite.yaml
+# ════════════════════════════════════════════════════════════════════════════
+
+commands:
+
+  # ───────────────────────── IDENTITY ─────────────────────────
+  - name: payer_ctx          # PAYER / proposer / escrow-group owner (acts AS the group)
+    type: whoami
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+  - name: payer_self_ctx     # issuer's OWN wallet — the policy's required signer / approver
+    type: whoami
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+  - name: beneficiary_ctx    # BENEFICIARY: deal party; policy executor; release payee
+    type: whoami
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+  - name: attestor_ctx       # NEUTRAL ATTESTOR: deal party; commits the cert doc at its OWN slot
+    type: whoami
+    user: { id: investor@yieldfabric.com, password: investor_password }
+
+  # ───────── FUND THE ESCROW GROUP OUT-OF-BAND (proven substrate path) ─────────
+  # 1000 AUD made SPENDABLE in G (deposit → instant → group accept_all). The deal
+  # below releases 300 of it to the beneficiary. (Seeds the per-run nonce.)
+  - name: fund_payer
+    type: deposit
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { asset_id: aud-token-asset, amount: 1000000000000000000000, idempotency_key: docesc-dms-fund-$(date +%s | tee /tmp/yf_docesc_dms_nonce) }
+  - name: pay_into_escrow
+    type: instant
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { asset_id: aud-token-asset, amount: 1000000000000000000000, destination_id: Issuer Group, idempotency_key: docesc-dms-payin-$(cat /tmp/yf_docesc_dms_nonce) }
+  - name: escrow_accept
+    type: accept_all
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { denomination: aud-token-asset, wait: true }
+
+  # ═══════════════ 1 — PAYER PROPOSES THE ESCROW DEAL (inline DealPlan) ═══════════════
+  # `$step.<id>.<out>` refs are resolved by the DEAL runtime (not the harness), so
+  # they pass through literally, quoted. Party entity-ids are baked from whoami.
+  # account_address points at the pre-existing (pre-funded) Issuer Group.
+  - name: propose_escrow
+    type: propose_deal
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      name: "Document Escrow (DMS) $(cat /tmp/yf_docesc_dms_nonce)"
+      parties:
+        - { entity_id: $beneficiary_ctx.user_id, role: beneficiary }
+        - { entity_id: $attestor_ctx.user_id, role: attestor }
+      idempotency_key: docesc-dms-propose-$(cat /tmp/yf_docesc_dms_nonce)
+      plan:
+        entry_step_ids: [commit_attestation]
+        agreement_metadata:
+          governing_law: "New York"
+          jurisdiction: "Southern District of New York"
+          platform_terms_version: "1.0.0"
+        nodes:
+          # The neutral attestor certifies the condition by committing an in-range
+          # document at its OWN oracle slot (obligor = the attestor's account).
+          - step_id: commit_attestation
+            task_name: commit_oracle_document
+            assignee_override: { kind: party, role: attestor }
+            inputs:
+              obligor: $attestor_ctx.default_wallet_id
+              key: "9600"
+              document_json: { condition_score: 95 }
+          # The payer registers the doc-gated release policy on G. Registrar ==
+          # sole required signer ⇒ approval is auto-collected at registration
+          # (no approve step). amount_bounds are RAW wei; the release amount below
+          # is human (the bridge scales it).
+          - step_id: register_release_policy
+            task_name: add_data_policy
+            assignee_override: { kind: proposer }
+            inputs:
+              acting_as_group: $payer_ctx.group_id
+              account_address: $payer_ctx.group_account_address
+              policy_id: "$(cat /tmp/yf_docesc_dms_nonce)50"
+              executor_accounts: [$beneficiary_ctx.default_wallet_id]
+              required_signers: [$payer_self_ctx.default_wallet_id]
+              min_signatories: 1
+              allowed_operations: [send]
+              amount_bounds:
+                - { token: aud-token-asset, lo: "0", hi: "500000000000000000000" }
+              requirements:
+                - source: 3
+                  obligor: $attestor_ctx.default_wallet_id   # the NEUTRAL attestor (not G, not the approver)
+                  token_id: "9600"
+                  oracle_query: '{"constraints": {"condition_score": {"min": 80, "max": 100}}}'
+              max_use: "1"
+              expiry: "$(date -u -v+365d +%Y-%m-%dT%H:%M:%SZ)"
+          # The beneficiary releases the escrow — executeUnderPolicy(Send → self),
+          # gated on the attestor's committed in-range document. policy_id binds
+          # the registered policy via the cross-step ref (resolves because
+          # addDataPolicy now returns + lifts policyId).
+          - step_id: release_escrow
+            task_name: execute_under_policy
+            assignee_override: { kind: party, role: beneficiary }
+            inputs:
+              account_address: $payer_ctx.group_account_address
+              # executeUnderPolicy rejects an individual-context caller — the
+              # beneficiary must submit AS the policy's group. The bridge mints a
+              # group delegation JWT; the on-chain executor gate still checks the
+              # beneficiary against the policy's executor_accounts.
+              acting_as_group: $payer_ctx.group_id
+              policy_id: "$step.register_release_policy.policy_id"
+              operation_type: Send
+              asset_id: aud-token-asset
+              amount: "300"
+              # Entity UUID (same form the template's `$party.beneficiary`
+              # resolves to). The executeUnderPolicy resolver now resolves a UUID
+              # destination → the entity's wallet address (for the vault send),
+              # and the post-processor resolves that address via wallet_by_address
+              # (for the payee record). Exercises that substrate fix end-to-end.
+              destination_id: $beneficiary_ctx.user_id
+        edges:
+          - { from: commit_attestation, to: register_release_policy, condition: { kind: on_success } }
+          - { from: register_release_policy, to: release_escrow, condition: { kind: on_success } }
+
+  - name: assert_deal_proposed
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$propose_escrow.deal_id"
+      contains: "DEAL"
+
+  # ═══════════════ 2 — BOTH COUNTERPARTIES SIGN → ACTIVATE ═══════════════
+  # The proposer (payer) auto-signs at propose. The beneficiary + attestor each
+  # sign; the LAST signer flips the deal Proposed → Active and starts the DAG.
+  - name: beneficiary_sign
+    type: sign_deal
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { deal_id: $propose_escrow.deal_id }
+
+  - name: attestor_sign
+    type: sign_deal
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { deal_id: $propose_escrow.deal_id }
+
+  - name: assert_deal_active
+    type: assert
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters:
+      actual: "$attestor_sign.status"
+      equals: "ACTIVE"
+
+  # ═══════════════ 3 — DRIVE THE DAG STEPS (caveat A) ═══════════════
+  # Step 1: the ATTESTOR commits the certification document.
+  - name: attestor_execute_commit
+    type: execute_step
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters:
+      deal_id: $propose_escrow.deal_id
+      step_id: commit_attestation
+      find_timeout: 90
+
+  # The document must be committed + persisted shared-at-rest before register
+  # derives the frozen constraint from it (caveat C).
+  - name: await_commit
+    type: sleep
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { seconds: 15 }
+
+  # Step 2: the PAYER registers the release policy (auto-approves at registration).
+  - name: payer_execute_register
+    type: execute_step
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      deal_id: $propose_escrow.deal_id
+      step_id: register_release_policy
+      find_timeout: 90
+
+  - name: await_register
+    type: sleep
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { seconds: 15 }
+
+  # ───────── BALANCES BEFORE RELEASE ─────────
+  - name: escrow_before
+    type: balance
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { asset_id: aud-token-asset }
+  - name: beneficiary_before
+    type: balance
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { asset_id: aud-token-asset }
+
+  # Step 3: the BENEFICIARY releases the escrow (caveat B — executor context).
+  - name: beneficiary_execute_release
+    type: execute_step
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters:
+      deal_id: $propose_escrow.deal_id
+      step_id: release_escrow
+      find_timeout: 90
+
+  - name: await_release
+    type: sleep
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { seconds: 15 }
+
+  # ───────── BENEFICIARY ACCEPTS the released payment + settle ─────────
+  - name: beneficiary_accept
+    type: accept_all
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { denomination: aud-token-asset, wait: true }
+  - name: beneficiary_settle
+    type: sleep
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { seconds: 20 }
+
+  # ═══════════════ 4 — CONSERVATION ASSERTS (G −300 == beneficiary +300) ═══════════════
+  - name: escrow_after
+    type: balance
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { asset_id: aud-token-asset }
+  - name: beneficiary_after
+    type: balance
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { asset_id: aud-token-asset }
+
+  - name: assert_escrow_debited
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      # EXACT: G fell by the released amount (300 AUD) — the deal-driven, doc-gated
+      # release executed through the DMS.
+      actual: "$escrow_before.private_balance"
+      minus: "$escrow_after.private_balance"
+      equals: "300000000000000000000"
+  - name: assert_beneficiary_credited
+    type: assert
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters:
+      # EXACT: the beneficiary's spendable balance rose by 300 AUD (conservation:
+      # G_debit == beneficiary_credit).
+      actual: "$beneficiary_after.private_balance"
+      minus: "$beneficiary_before.private_balance"
+      equals: "300000000000000000000"
+  - name: assert_beneficiary_no_leak
+    type: assert
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters:
+      actual: "$beneficiary_after.locked_in"
+      equals: "[]"

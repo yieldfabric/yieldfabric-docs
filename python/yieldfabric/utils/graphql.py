@@ -73,6 +73,7 @@ class GraphQLMutation:
             obligationResult
             messageId
             contractId
+            tokenId
             transactionId
             signature
             timestamp
@@ -80,7 +81,7 @@ class GraphQLMutation:
         }
     }
     """
-    
+
     ACCEPT_OBLIGATION = """
     mutation AcceptObligation($input: AcceptObligationInput!) {
         acceptObligation(input: $input) {

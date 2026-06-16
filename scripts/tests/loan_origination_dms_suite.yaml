@@ -1,0 +1,146 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  LOAN ORIGINATION — through the DMS DEAL FLOW (the real template path)
+# ════════════════════════════════════════════════════════════════════════════
+#
+#  Unlike loan_origination_suite.yaml (which calls the payments operations
+#  directly), THIS drives the actual `loan` deal TEMPLATE through the DMS:
+#    proposeDeal(template plan.json) → sign (auto-activates → compile_to_pipeline)
+#    → execute_step each of the 6 nodes as its assignee → verify the disbursement.
+#  This is what exercises compile_to_pipeline + the deal-flow workflow — the code
+#  the template change actually touches.
+#
+#  The template (yieldfabric-dms/templates/loan/plan.json) is loaded VERBATIM via
+#  propose_deal's `plan_file` (no inline copy → no drift). Its 5 nodes:
+#    create_loan_account (lender) · fund_loan_account (lender) · mint_loan_agreement
+#    (borrower) · disburse_swap (borrower, offers the agreement) · complete_disburse_swap
+#    (lender, AS the loan account, funds the principal)   — then a periodic repay phase.
+#
+#  Roles: lender = issuer (proposer; owns the loan-account group + the perms to act
+#  AS it — SuperAdmin in the demo). borrower = payer (counterparty, role "borrower").
+#  Amounts match the template (principal 1000 = 1000e18) — sized to the seeded
+#  faucet balance so the lender's pre-fund + the deal's fund step both clear.
+#
+#  ⚠️ execute_step drives ONE deferred step as its assignee and waits for the step's
+#     pending action; some steps may auto-fire under the activator and execute_step
+#     then no-ops idempotently — both are success. Slow chains may need a bigger
+#     find_timeout. Fresh deploy + setup.yaml.
+#  Run: PYTHONPATH=. python -m yieldfabric.cli execute ../scripts/tests/loan_origination_dms_suite.yaml
+# ════════════════════════════════════════════════════════════════════════════
+
+commands:
+
+  # ───────────────────────── IDENTITY ─────────────────────────
+  - name: lender_ctx          # issuer = proposer; owns the loan-account group
+    type: whoami
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+  - name: borrower_ctx        # payer = the borrower party (its entity id seeds the deal)
+    type: whoami
+    user: { id: payer@yieldfabric.com, password: payer_password }
+
+  # ───────── PRE-FUND the lender so the template's fund_loan_account step clears ─────────
+  - name: lender_prefund
+    type: deposit
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { asset_id: aud-token-asset, amount: 1000000000000000000000, idempotency_key: lod-prefund-$(date +%s | tee /tmp/yf_lod_nonce) }
+
+  - name: borrower_before     # the borrower's spendable BEFORE the loan is originated
+    type: balance
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { asset_id: aud-token-asset }
+
+  # ───────── PROPOSE the ACTUAL template + sign (auto-activate ⇒ DMS compiles it) ─────────
+  - name: propose
+    type: propose_deal
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      plan_file: ../../yieldfabric-dms/templates/loan/plan.json
+      parties: [ { entity_id: "$borrower_ctx.user_id", role: borrower } ]
+      name: "Origination loan (DMS e2e)"
+      idempotency_key: lod-propose-$(cat /tmp/yf_lod_nonce)
+  - name: sign                # the borrower (last/only signer) signs ⇒ deal goes ACTIVE
+    type: sign_deal
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { deal_id: "$propose.deal_id" }
+
+  # ───────── DRIVE each node through the deal-flow, as its assignee ─────────
+  - name: exec_create_account
+    type: execute_step
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { deal_id: "$propose.deal_id", step_id: create_loan_account, find_timeout: 120 }
+  # PACING (required): the group-account DEPLOY is the slowest async op; `group_wallet_id`
+  # + `group_id` are seeded onto the step result only after it lands on chain. fund /
+  # disburse-counterparty / complete-acting_as all bind those — let it settle.
+  - name: settle_account
+    type: sleep
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { seconds: 30 }
+  - name: exec_fund
+    type: execute_step
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { deal_id: "$propose.deal_id", step_id: fund_loan_account, find_timeout: 120 }
+  # No accept step: instant_send auto-completes to the loan account's spendable balance,
+  # so the account can fund the swap at completion without an intervening accept leg.
+  - name: exec_mint
+    type: execute_step          # the BORROWER mints the bare agreement
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { deal_id: "$propose.deal_id", step_id: mint_loan_agreement, find_timeout: 120 }
+  # PACING (required): execute_step returns as soon as /execute is ACCEPTED — the
+  # on-chain op is spawned async. create_composed_contract seeds its server-generated
+  # `composed_contract_id` onto its step result only AFTER it settles (~6-8s). The swap
+  # binds that id (`reresolve_input_bindings` fills it at disburse's /execute), so the
+  # mint MUST fully settle first — else disburse sees `[null]` and reverts
+  # NeedInitiatorAssets(). A UI deal paces naturally (human executes the swap after the
+  # mint completes); the harness drives back-to-back, so wait here.
+  - name: settle_mint
+    type: sleep
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { seconds: 25 }
+  - name: exec_disburse
+    type: execute_step          # the BORROWER initiates the swap, offering the bare agreement
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { deal_id: "$propose.deal_id", step_id: disburse_swap, find_timeout: 120 }
+  # PACING (required): same reason — completeSwap binds `disburse_swap.swap_id` AND the
+  # resolver rejects completeSwap until createSwap's graph processing materializes the
+  # swap ("Wait for createSwap graph processing before completeSwap"). Let it settle.
+  - name: settle_swap_create
+    type: sleep
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { seconds: 35 }
+  - name: exec_complete
+    type: execute_step          # the LENDER completes AS the loan account ⇒ it funds the principal ⇒ settles
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { deal_id: "$propose.deal_id", step_id: complete_disburse_swap, find_timeout: 120 }
+  # PACING (required): execute_step returns on /execute-accept; the on-chain completeSwap
+  # + the delivery of the principal to the borrower settle AFTER. The borrower can only
+  # accept once the swap payment has landed in their acceptable state — so wait here
+  # BEFORE accepting. Mirrors doc_escrow_dms's await_release and rental_nft_dms's
+  # await_a_exec (a confidential payment only finalizes once the recipient accepts, and
+  # the recipient can't accept until it's delivered).
+  - name: await_complete
+    type: sleep
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { seconds: 25 }
+
+  # ───────── VERIFY the disbursement reached the borrower ─────────
+  - name: borrower_accept     # the principal arrives confidential (locked_in) ⇒ accept to spend
+    type: accept_all
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { denomination: aud-token-asset, wait: true }
+  - name: settle_disburse
+    type: sleep
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { seconds: 20 }
+  - name: borrower_after
+    type: balance
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { asset_id: aud-token-asset }
+  - name: assert_borrower_received
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      # The borrower's spendable rose by EXACTLY the principal — the DMS-driven deal
+      # funded the loan account, minted the bare agreement, and swapped it for the
+      # principal end-to-end. (Directional `gt` would also pass; exact pins it.)
+      actual: "$borrower_after.private_balance"
+      minus: "$borrower_before.private_balance"
+      equals: "1000000000000000000000"

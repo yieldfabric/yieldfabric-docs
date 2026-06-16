@@ -134,10 +134,13 @@ class PaymentExecutor(BaseExecutor):
         params = command.parameters
         denomination = params.denomination or params.asset_id
 
+        contract_id = getattr(params, "contract_id", None)
+
         self.log_parameters({
             "denomination": denomination,
             "amount": params.amount,
             "destination_id": params.destination_id,
+            "contract_id": contract_id,
             "idempotency_key": params.idempotency_key,
         })
 
@@ -148,6 +151,12 @@ class PaymentExecutor(BaseExecutor):
                 "destinationId": params.destination_id,
             }
         }
+        # Route by an existing contract instead of an explicit destination. The
+        # resolver resolves the payee from the contract's parties — for an
+        # OBLIGATION (`CONTRACT-OBLIGATION-…`) that's the current NFT HOLDER, so
+        # the payment follows a transfer. Lets a suite prove holder-routing.
+        if contract_id:
+            variables["input"]["contractId"] = contract_id
         if params.idempotency_key:
             variables["input"]["idempotencyKey"] = params.idempotency_key
 

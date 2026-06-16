@@ -1,0 +1,333 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  TRANSFERABLE LOAN — UNATTENDED NOTE-HOLDER AUTO-COLLECT, FOLLOWS A SALE
+# ════════════════════════════════════════════════════════════════════════════
+#
+#  The auto-collect counterpart to rental_nft_executor_transfer_suite (which
+#  proves the MANUAL executeUnderPolicy + transfer). This proves the UNATTENDED
+#  side: the `loan_collect_scheduler` drives `executeUnderPolicy(Send→self)` from
+#  the servicing account under the current holder's ARMED key — no manual execute —
+#  and FOLLOWS a sale: transfer the note, the buyer (after arming their own key)
+#  auto-collects; the seller's armed key stops working (on-chain ownerOf gate).
+#
+#  MODEL (the transferable loan on the proven policy primitive):
+#    G        = the SERVICING account (the "Issuer Group") — repayments are paid
+#               INTO it; the current note-holder collects FROM it under the policy.
+#    servicer = issuer (OWNS G; registers + approves the send policy). NOT a holder.
+#    lender   = collateral (the FIRST note-holder; mints + holds the note; collects
+#               from G; later SELLS the note). This is the entity whose on-chain
+#               ownerOf gates the collect — so it is the entity that ARMS auto-collect.
+#    borrower = payer (funds G — the repayment).
+#    buyer    = investor (the loan is SOLD to it; must auto-collect after).
+#    note NFT = a payment-less obligation in a TRANSFERABLE class = the executor
+#               credential. Policy executor = (note collection, tokenId); on-chain
+#               ownerOf resolves the executor LIVE, so a transfer moves the right.
+#
+#  WHAT THIS ADDS over the manual suite: steps `arm_*` (the holder mints a yf_api_…
+#  key + `setLoanCollectAutomation` with the loan's collect params) and the SLEEPS
+#  past a scheduler tick — then asserts G was debited WITHOUT any manual execute.
+#
+#  ⚠️  TIMING: the loan_collect_scheduler ticks every 30s (+9s boot stagger). After
+#  arming, sleep ~70s to span a tick. Two collect windows ⇒ ~3 min + setup.
+#
+#  HARNESS: needs the `set_loan_collect_key` command (added to DealExecutor) + the
+#  policy commands (already wired). Run:
+#    PYTHONPATH=. python -m yieldfabric.cli execute \
+#      ../scripts/tests/loan_auto_collect_transfer_suite.yaml
+#  Fresh deploy + setup.yaml (issuer/payer/investor seeded), all 3 services up.
+# ════════════════════════════════════════════════════════════════════════════
+
+commands:
+
+  # ───────────────────────── IDENTITY ─────────────────────────
+  - name: lender_ctx       # SERVICER: owns G (Issuer Group); registers + approves the policy
+    type: whoami
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+  - name: lender_self_ctx  # issuer's OWN wallet (the policy approver / required signer)
+    type: whoami
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+  - name: holder_ctx       # LENDER = first note-holder; mints + holds the note; collects from G
+    type: whoami
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+  - name: borrower_ctx     # funds G (the repayment)
+    type: whoami
+    user: { id: payer@yieldfabric.com, password: payer_password }
+  - name: buyer_ctx        # the loan is sold to it; must auto-collect after
+    type: whoami
+    user: { id: investor@yieldfabric.com, password: investor_password }
+
+  # ───────── FUND G (the BORROWER's repayment goes INTO the servicing account) ─────────
+  - name: fund_borrower
+    type: deposit
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { asset_id: aud-token-asset, amount: 1000000000000000000000, idempotency_key: lac-fund-$(date +%s | tee /tmp/yf_lac_nonce) }
+  - name: pay_into_g
+    type: instant
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { asset_id: aud-token-asset, amount: 1000000000000000000000, destination_id: Issuer Group, idempotency_key: lac-payin-$(cat /tmp/yf_lac_nonce) }
+  - name: g_accept
+    type: accept_all
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { denomination: aud-token-asset, wait: true }
+
+  # ───────── 1 — DEPLOY NOTE CLASS + LENDER MINTS THE NOTE (holds it) ─────────
+  - name: deploy_note
+    type: deploy_class
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { name: "Loan Note Class", symbol: NOTE, open_minting: true, transferable: true, idempotency_key: lac-class-$(cat /tmp/yf_lac_nonce) }
+  - name: mint_note
+    type: create_obligation
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters:
+      obligation_address: "$deploy_note.obligation_address"
+      counterpart: collateral@yieldfabric.com
+      expiry: $(date -u -d '+365 days' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+365d +%Y-%m-%dT%H:%M:%SZ)
+      data: { name: "Loan Note", description: "Bearer note: the holder collects the borrower's repayments from G" }
+      idempotency_key: lac-mint-$(cat /tmp/yf_lac_nonce)
+
+  # ───────── 2 — LENDER REGISTERS + APPROVES THE SEND POLICY (executor = the note) ─────────
+  - name: reg_policy
+    type: add_data_policy
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters:
+      account_address: $lender_ctx.default_wallet_id
+      wallet_id: $lender_ctx.default_wallet_id
+      policy_id: "880001"
+      expiry: "$(date -d '+365 days' +%s 2>/dev/null || date -v+365d +%s)"
+      max_use: "24"
+      min_signatories: 1
+      required_signers: [ $lender_self_ctx.default_wallet_id ]
+      executor_accounts: [ "$deploy_note.obligation_address" ]
+      executor_ids:      [ "$mint_note.token_id" ]
+      allowed_operations: [ send ]
+      amount_bounds:
+        - { token: aud-token-asset, lo: "0", hi: "200000000000000000000" }
+      requirements:
+        - { source: 0, denomination: aud-token-asset, lo: "0", hi: "1000000000000000000000000000" }
+      idempotency_key: lac-reg-$(cat /tmp/yf_lac_nonce)
+  - name: approve_policy
+    type: approve_data_policy
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { account: $lender_ctx.group_account_address, policy_id: "880001" }
+
+  # ═══════════ 3 — LENDER (the holder) ARMS AUTO-COLLECT → scheduler collects ═══════════
+  # ★ THE UNATTENDED PROOF: the lender ONLY arms a key + the loan params; the
+  #   loan_collect_scheduler mints the PolicyExecution delegation and drives
+  #   executeUnderPolicy(Send→self) on its own. No manual execute_under_policy here.
+  - name: g_before_1
+    type: balance
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { asset_id: aud-token-asset }
+  - name: holder_before_1    # the holder's (collateral@) OWN spendable BEFORE collecting
+    type: balance
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { asset_id: aud-token-asset }
+
+  - name: arm_lender
+    # The NOTE HOLDER arms (collateral@ = the lender). It is the entity whose
+    # on-chain ownerOf(note) gates the collect, so the scheduler must drive under
+    # ITS key — issuer (the servicer) holds no note and would revert the on-chain gate.
+    type: set_loan_collect_key
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters:
+      wallet_id: $holder_ctx.default_wallet_id
+      servicing_group_id: $lender_ctx.group_id
+      servicing_account: $lender_ctx.group_account_address
+      policy_id: "880001"
+      token_address: aud-token-asset
+      amount: "100000000000000000000"
+      # PACED: collect ONE `amount` per `period_secs`, not every 30s tick. 600s ≫
+      # the 75s window below, so within the window (which spans 2+ ticks) the holder
+      # collects exactly ONCE — proving the scheduler does NOT sweep G every tick
+      # (the over-collection the audit found). Period 2 (arm+600) never fires in-test.
+      period_secs: 600
+      key_label: "loan-collect-lender"
+
+  - name: await_collect_1
+    # 120s spans ~4 scheduler ticks (30s each) with ≥30s settle headroom after the
+    # latest possible first-collect tick (~arm+30) — enough to absorb a slow ZK
+    # settle so the exact ==100 read isn't raced (matches the proven rental suite's
+    # 120s window). A PACED scheduler collects EXACTLY once here (period_secs=600);
+    # the old every-tick scheduler would collect 3-4× and fail the exact == 100 assert.
+    type: sleep
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { seconds: 120 }
+
+  - name: g_after_1
+    type: balance
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { asset_id: aud-token-asset }
+  - name: assert_collected_unattended
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      # EXACT: G fell by EXACTLY one period (100 AUD), not swept. `minus` rewrites
+      # actual := g_before_1 - g_after_1, so this asserts the debit == one `amount`.
+      # This is the over-collection guard: the old every-tick scheduler would debit
+      # 200-300+ across the 75s window and FAIL here.
+      actual: "$g_before_1.private_balance"
+      minus: "$g_after_1.private_balance"
+      equals: "100000000000000000000"
+
+  # ★ RECEIPT PROOF (kills the false positive): "G debited" alone could mask funds
+  #   that left G but sit unaccepted in the holder's account. The holder acceptAlls
+  #   the collected payment, then we assert its OWN spendable balance actually ROSE —
+  #   proving the unattended collect DELIVERED spendable funds to the holder.
+  - name: holder_accept_1
+    type: accept_all
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { denomination: aud-token-asset, wait: true }
+  - name: holder_settle_1
+    # accept_all's `wait` covers the on-chain accept, but the follow-on `retrieve`
+    # that actually credits the spendable balance (`ln`) settles asynchronously a
+    # few seconds later. Reading the balance immediately races that credit and sees
+    # 0. Span the retrieve before asserting (observed ~6s; 20s for margin).
+    type: sleep
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { seconds: 20 }
+  - name: holder_after_1
+    type: balance
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { asset_id: aud-token-asset }
+  - name: assert_holder_received
+    type: assert
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters:
+      # EXACT: the holder's spendable balance rose by EXACTLY one period (100 AUD) —
+      # the collect DELIVERED spendable funds, and the amount matches the G debit
+      # (conservation: G_debit == holder_credit).
+      actual: "$holder_after_1.private_balance"
+      minus: "$holder_before_1.private_balance"
+      equals: "100000000000000000000"
+  - name: assert_holder_no_leak
+    type: assert
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters:
+      # LEAK GUARD: nothing left unaccepted. The old over-collecting scheduler kept
+      # collecting past the single accept_all, leaving ~40% stuck locked_in; with
+      # paced one-per-period collection the holder accepted ALL of it.
+      actual: "$holder_after_1.locked_in"
+      equals: "[]"
+
+  # ═══════════ 4 — SELL THE LOAN: transfer the note, then the seller REVOKES ═══════════
+  - name: transfer_note
+    type: transfer_obligation
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { contract_id: $mint_note.contract_id, destination_id: investor@yieldfabric.com, idempotency_key: lac-xfer-$(cat /tmp/yf_lac_nonce) }
+  # ★ REVOKE-ON-SALE: the seller stops its now-stale auto-collect so the scheduler
+  #   no longer retries it every tick (the churn the audit found). The negative
+  #   assert below proves the seller earns 0 after this.
+  - name: seller_revokes
+    type: revoke_loan_collect_key
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters:
+      wallet_id: $holder_ctx.default_wallet_id
+      policy_id: "880001"
+  - name: seller_before_postsale    # seller's (collateral@) spendable right after the sale
+    type: balance
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { asset_id: aud-token-asset }
+
+  # ═══════════ 5 — BUYER (new holder) ARMS → scheduler collects FOR THE BUYER ═══════════
+  # ★ THE FOLLOWS-A-SALE PROOF: investor is named in NO policy, yet after arming its
+  #   own key the scheduler collects for it — purely because it now holds the note
+  #   (on-chain ownerOf). The lender's still-armed key now fails the ownerOf gate.
+  - name: g_before_2
+    type: balance
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { asset_id: aud-token-asset }
+  - name: buyer_before_2    # the buyer's (investor@) OWN spendable BEFORE collecting
+    type: balance
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { asset_id: aud-token-asset }
+
+  - name: arm_buyer
+    type: set_loan_collect_key
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters:
+      wallet_id: $buyer_ctx.default_wallet_id
+      servicing_group_id: $lender_ctx.group_id
+      servicing_account: $lender_ctx.group_account_address
+      policy_id: "880001"
+      token_address: aud-token-asset
+      amount: "100000000000000000000"
+      period_secs: 600   # same pacing as the lender — exactly one collect in the window
+      key_label: "loan-collect-buyer"
+
+  - name: await_collect_2
+    # 120s (same as await_collect_1) — settle headroom for the exact ==100 read. The
+    # buyer collects EXACTLY once (paced); the REVOKED seller collects nothing —
+    # proven by the negative seller assert at the end.
+    type: sleep
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { seconds: 120 }
+
+  - name: g_after_2
+    type: balance
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { asset_id: aud-token-asset }
+  - name: assert_buyer_auto_collected
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      # EXACT: G fell by EXACTLY one period again, collected for the NEW holder after
+      # the sale (no policy re-registration). One period, not a sweep.
+      actual: "$g_before_2.private_balance"
+      minus: "$g_after_2.private_balance"
+      equals: "100000000000000000000"
+
+  # ★ BUYER RECEIPT PROOF: the TRANSFERRED collect-right actually delivers spendable
+  #   funds to the buyer. investor accepts + asserts its OWN balance rose — closing
+  #   the loop on "the loan was sold AND the buyer now earns the repayments."
+  - name: buyer_accept_2
+    type: accept_all
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { denomination: aud-token-asset, wait: true }
+  - name: buyer_settle_2
+    # Same as holder_settle_1 — let the async retrieve credit `ln` before reading.
+    type: sleep
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { seconds: 20 }
+  - name: buyer_after_2
+    type: balance
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { asset_id: aud-token-asset }
+  - name: assert_buyer_received
+    type: assert
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters:
+      # EXACT: the buyer's spendable balance rose by EXACTLY one period — the SOLD
+      # collect-right delivers spendable funds to the new holder (conservation:
+      # G_debit == buyer_credit).
+      actual: "$buyer_after_2.private_balance"
+      minus: "$buyer_before_2.private_balance"
+      equals: "100000000000000000000"
+  - name: assert_buyer_no_leak
+    type: assert
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters:
+      actual: "$buyer_after_2.locked_in"
+      equals: "[]"
+
+  # ═══════════ 6 — NEGATIVE: the REVOKED SELLER earns NOTHING after the sale ═══════════
+  # ★ Proves both the revoke-on-sale AND the on-chain ownerOf revocation: across the
+  #   buyer's whole collect window (multiple ticks) the seller's spendable balance did
+  #   NOT move — the collect-right MOVED to the buyer, it did not duplicate.
+  - name: seller_after_postsale
+    type: balance
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { asset_id: aud-token-asset }
+  - name: assert_seller_earns_zero
+    type: assert
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters:
+      # EXACT 0: seller's spendable is unchanged from right-after-sale to end-of-buyer-
+      # leg. A stale-credential over-collect (the churn bug) would move this.
+      actual: "$seller_after_postsale.private_balance"
+      minus: "$seller_before_postsale.private_balance"
+      equals: "0"
+  - name: assert_seller_no_leak
+    type: assert
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters:
+      actual: "$seller_after_postsale.locked_in"
+      equals: "[]"

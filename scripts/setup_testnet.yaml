@@ -48,7 +48,7 @@ tokens:
   - id: AUD
     name: AUD Token
     description: AUD Token Description
-    address: 0x126D8F3d5274339B3Ac2a80eC30Cc46A8A404DCc
+    address: 0x84e6E4a060D05621e4C7185c54DA389D30623Df3
     chain_id: 153
   # - id: CBDC
   #   name: CBDC Token

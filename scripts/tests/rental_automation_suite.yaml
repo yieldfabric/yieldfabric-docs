@@ -1,0 +1,457 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  RENTAL AUTOMATION — two-sided auto-collect + auto-settle on the OBLIGATION
+#  rental (the rental_automation_scheduler driving the manual collect→swap→
+#  settle flow unattended)
+# ════════════════════════════════════════════════════════════════════════════
+#
+#  WHAT THIS TESTS — the rental_automation_scheduler (yieldfabric-agents/src/
+#  jobs/rental_automation_scheduler.rs) firing the EXISTING obligation rent
+#  lifecycle on a schedule, under each party's own armed credential:
+#
+#    landlord proposes an OBLIGATION rental deal (create_group_account +
+#    add_data_policy + create_composed_contract — the shape buildRentalDraft
+#    emits, NOT a periodic_template) → tenant signs → setup steps run → tenant
+#    accepts the lease (escrows the rent leg) →
+#      • LANDLORD arms AUTO-COLLECT (role "proposer") — the worker's Branch L
+#        accepts the due leg into property-account CREDIT, then opens the
+#        credit↔cash settlement swap, all AS the property group (delegation JWT
+#        minted from the landlord's key — the landlord is the group owner).
+#      • TENANT arms AUTO-SETTLE (role "tenant") — the worker's Branch T
+#        completeSwaps the open settlement (the tenant paying the cash leg).
+#    → the rent is collected + settled with NO manual Collect/Settle clicks.
+#
+#  This is the automation counterpart to rental_flow_suite.yaml (which drives
+#  the SAME collect/swap/settle steps MANUALLY). The mechanics on-chain are
+#  identical; only the trigger differs (a worker tick instead of a button).
+#
+#  It also exercises the role-filtered `deal_automation_status` (the harness's
+#  deal_automation_status step now accepts a `role:` filter, because the
+#  resolver returns a LIST — one row per arming party).
+#
+#  ──────────────────────────────────────────────────────────────────────────
+#  REQUIREMENTS to run:
+#    • All three services up: auth (:3000), payments (:3002), agents (:3001).
+#      The deal-flow + the rental_automation_scheduler live in agents.
+#    • Parties seeded via setup.yaml (SuperAdmins).
+#    • ⏱  CADENCE IS PER-DEAL — the propose_rental plan below sets
+#         `automation.cadence_seconds: 5`, so the worker scans this rental every
+#         5s (no env var). The worker ticks at the MIN cadence across armed
+#         rentals; deals that omit it use the 60s default. The waits below
+#         assume the ~5s cadence this plan declares.
+#    • Run (from yieldfabric-docs/python):
+#        PYTHONPATH=. python -m yieldfabric.cli execute \
+#          ../scripts/tests/rental_automation_suite.yaml
+#
+#  ⚠️  UNVERIFIED — AUTHORED FROM SOURCE, NOT YET SMOKE-RUN. Two areas WILL
+#  need confirmation/adjustment on the first live run; both are flagged inline:
+#    (A) PER-STEP DEFERRAL. The four deal nodes (create_property,
+#        add_send_policy, rent, accept_rent) are on-chain steps with named
+#        assignees, so per the working-group rule "a payment step with a named
+#        human assignee defers to the assignee's inbox" each is driven here via
+#        an explicit `execute_step`. IF a chained step auto-advances after its
+#        predecessor instead of deferring, its `execute_step` will find no
+#        pending action and time out — drop that step's execute_step when the
+#        run shows it already ran. (periodic_rental_suite only had to drive the
+#        single setup node; this obligation plan has four.)
+#    (B) WORKER TIMING. Branch L (collect+swap) and Branch T (settle) act on
+#        separate ticks (the swap must be on-chain before settle sees it), so
+#        the cycle is multi-tick. The post-arm sleep is sized for the ~5s fast
+#        interval; if a balance assert reads an intermediate state, lengthen it.
+#
+#  PARTIES (seeded SuperAdmins; see setup.yaml):
+#    originator@yieldfabric.com — LANDLORD (proposer; owns the property group;
+#                                 self-manages, so also the policy executor;
+#                                 arms AUTO-COLLECT)
+#    payer@yieldfabric.com      — TENANT  (signs; accepts + escrows the lease;
+#                                 arms AUTO-SETTLE; pays the cash leg)
+#
+#  AMOUNTS: one rent leg of 1000 AUD, due 7 days ago (immediately collectable);
+#  tenant funded 5000 AUD (covers the accept escrow + the settlement cash).
+# ════════════════════════════════════════════════════════════════════════════
+
+commands:
+
+  # ───────────────────────── IDENTITY ─────────────────────────
+  - name: landlord_ctx
+    type: whoami
+    user: { id: originator@yieldfabric.com, password: originator_password }
+
+  - name: tenant_ctx
+    type: whoami
+    user: { id: payer@yieldfabric.com, password: payer_password }
+
+  # ───────────────────────── FUNDING ─────────────────────────
+  # The tenant escrows the rent leg at accept and pays the cash leg at settle.
+  # 5000 covers both with margin. (Seeds the run nonce used by ids below.)
+  - name: fund_tenant
+    type: deposit
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      asset_id: aud-token-asset
+      amount: 5000000000000000000000
+      idempotency_key: rental-auto-fund-$(date +%s | tee /tmp/yf_rental_auto_nonce)
+
+  # ═══════════════ 1 — LANDLORD PROPOSES THE OBLIGATION RENTAL DEAL ═══════════════
+  # The exact plan buildRentalDraft emits (yieldfabric-app/src/components/
+  # rentals/rentalModel.ts): create_property (the property GROUP) →
+  # add_send_policy → rent (create_composed_contract: the lease obligation,
+  # group is holder, tenant is counterpart + obligor) → accept_rent (tenant).
+  # Self-managed: the landlord is the proposer AND the policy executor (no
+  # separate agent party), so the only counter-signing party is the tenant.
+  #
+  # `$step.<id>.<out>` refs are resolved by the DEAL runtime (NOT the harness —
+  # there is no command named `step`), so they pass through literally, quoted.
+  #
+  # The single rent leg's `due_date` is 7 DAYS AGO so the leg is immediately
+  # due (unlock_receiver <= now) once accepted — the worker's Branch L collect
+  # gate (`due_leg_target`: status PENDING AND unlockReceiver <= now) fires on
+  # the first tick after the tenant escrows it.
+  - name: propose_rental
+    type: propose_deal
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      name: "12 Smith St — Obligation Lease (auto)"
+      parties:
+        - { entity_id: $tenant_ctx.user_id, role: tenant }
+      idempotency_key: rental-auto-propose-$(cat /tmp/yf_rental_auto_nonce)
+      plan:
+        entry_step_ids: [create_property]
+        # Per-deal automation cadence (DealPlan.automation) — the worker scans
+        # at the MIN cadence across armed rentals, so this 5s makes the worker
+        # tick fast for the test WITHOUT a global env var. Omit it in
+        # production rentals to use the worker's 60s default.
+        automation:
+          cadence_seconds: 5
+        agreement_metadata:
+          governing_law: "New South Wales"
+          jurisdiction: "Sydney, Australia"
+          platform_terms_version: "1.0.0"
+        nodes:
+          - step_id: create_property
+            task_name: create_group_account
+            inputs:
+              name: "12 Smith St — Property Account $(cat /tmp/yf_rental_auto_nonce)"
+              group_type: "custom"
+              description: "Property account that collects rent and from which the managing agent may disburse."
+            assignee_override: { kind: proposer }
+          - step_id: add_send_policy
+            task_name: add_data_policy
+            inputs:
+              # The bridge strips acting_as_group + resolves the group refs; the
+              # policy registers AS the property group account. Self-managed:
+              # executor + signer are both the landlord (the proposer/owner).
+              acting_as_group: "$step.create_property.group_id"
+              account_address: "$step.create_property.group_account_address"
+              policy_id: "1"
+              executor_accounts: [$landlord_ctx.user_id]
+              required_signers: [$landlord_ctx.user_id]
+              min_signatories: 1
+              allowed_operations: [send]
+              amount_bounds:
+                - { token: aud-token-asset, lo: "0", hi: "500000000000000000000" }
+              requirements:
+                - { source: 0, denomination: aud-token-asset, lo: "0", hi: "1000000000000000000000000000" }
+              expiry: "$(date -u -v+365d +%Y-%m-%dT%H:%M:%SZ)"
+              max_use: "8"
+          - step_id: rent
+            task_name: create_composed_contract
+            inputs:
+              name: "12 Smith St — Property Account $(cat /tmp/yf_rental_auto_nonce) Rent"
+              description: "Monthly rent payable by the tenant to the property account."
+              acting_as_group: "$step.create_property.group_id"
+              counterpart: $tenant_ctx.user_id
+              obligations:
+                - name: "Monthly Rent"
+                  denomination: aud-token-asset
+                  obligor: $tenant_ctx.user_id
+                  notional: "1000"
+                  expiry: "$(date -u -v+365d +%Y-%m-%dT%H:%M:%SZ)"
+                  data: { name: "Monthly Rent", description: "Rent payable monthly to the property account" }
+                  payment_schedule:
+                    amount: "1000"
+                    legs:
+                      - { due_date: "$(date -u -v-7d +%Y-%m-%dT%H:%M:%SZ)" }
+          - step_id: accept_rent
+            task_name: accept_obligation
+            assignee_override: { kind: party, role: tenant }
+            inputs:
+              contract_id: "$step.rent.composed_contract_id"
+        edges:
+          - { from: create_property, to: add_send_policy, condition: { kind: on_success } }
+          - { from: add_send_policy, to: rent,          condition: { kind: on_success } }
+          - { from: rent,            to: accept_rent,   condition: { kind: on_success } }
+
+  - name: assert_deal_proposed
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      actual: "$propose_rental.deal_id"
+      contains: "DEAL"
+
+  # ═══════════════ 2 — TENANT SIGNS → ACTIVATE ═══════════════
+  # The proposer auto-signs at propose; the tenant's signature flips the deal
+  # Proposed → Active and starts the setup workflow.
+  - name: tenant_sign
+    type: sign_deal
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+
+  - name: assert_deal_active
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      actual: "$tenant_sign.status"
+      equals: "ACTIVE"
+
+  # ═══════════════ 3 — DRIVE THE SETUP STEPS (see caveat A) ═══════════════
+  # Each node is an on-chain step with a named assignee, so per the per-step
+  # consent rule each defers to its assignee's inbox and is driven explicitly.
+  # If a chained step auto-advances instead, drop its execute_step (its action
+  # won't be pending and execute_step will time out — that's the signal).
+  - name: landlord_execute_create_property
+    type: execute_step
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+      step_id: create_property
+      find_timeout: 90
+
+  # create_group_account polls the on-chain account deploy (~90s); let it settle
+  # before the policy + mint steps that resolve $step.create_property refs.
+  - name: await_property_deploy
+    type: sleep
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters: { seconds: 120 }
+
+  - name: landlord_execute_add_policy
+    type: execute_step
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+      step_id: add_send_policy
+      find_timeout: 90
+
+  - name: landlord_execute_rent_mint
+    type: execute_step
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+      step_id: rent
+      find_timeout: 90
+
+  # Let the lease mint settle so the leg payment row exists for the tenant's
+  # accept (and, after that, for the worker's collect).
+  - name: await_rent_mint
+    type: sleep
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters: { seconds: 20 }
+
+  # The TENANT accepts the lease — bundles the escrow send for the rent leg in
+  # one meta-tx from the tenant's account (the tenant becomes the on-chain
+  # payer). This is the tenant's one-time consent; the RECURRING collect/swap/
+  # settle is what the worker automates below.
+  - name: tenant_execute_accept
+    type: execute_step
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+      step_id: accept_rent
+      find_timeout: 90
+
+  - name: await_accept_escrow
+    type: sleep
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { seconds: 20 }
+
+  # ═══════════════ 4 — SNAPSHOTS BEFORE AUTOMATION ═══════════════
+  # The property group's CASH before the cycle (fresh group ⇒ ~0). After the
+  # full auto collect→swap→settle + the group's claim, it must hold one rent.
+  - name: property_ctx
+    type: whoami
+    user:
+      id: originator@yieldfabric.com
+      password: originator_password
+      group: "12 Smith St — Property Account $(cat /tmp/yf_rental_auto_nonce)"
+
+  - name: assert_property_account_real
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      actual: "$property_ctx.group_account_address"
+      contains: "0x"
+
+  - name: group_cash_before
+    type: balance
+    user:
+      id: originator@yieldfabric.com
+      password: originator_password
+      group: "12 Smith St — Property Account $(cat /tmp/yf_rental_auto_nonce)"
+    parameters: { asset_id: aud-token-asset }
+
+  # The tenant's cash AFTER they escrowed the lease — the baseline for the
+  # auto-settle delta (the cash leg the worker drives them to pay).
+  - name: tenant_cash_before_settle
+    type: balance
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { asset_id: aud-token-asset }
+
+  # ═══════════════ 5 — ARM BOTH SIDES ═══════════════
+  # Landlord arms AUTO-COLLECT (role derived server-side = "proposer", since the
+  # landlord is the deal proposer). The worker's Branch L mints a group
+  # delegation JWT from this key (the landlord owns the group ⇒ the mint is the
+  # authoritative ownership gate) and runs collect + swap as the group.
+  - name: arm_collect
+    type: set_automation_key
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+      key_label: "auto-collect"
+
+  # Tenant arms AUTO-SETTLE (role "tenant"). The worker's Branch T completeSwaps
+  # the open settlement under the tenant's own JWT.
+  - name: arm_settle
+    type: set_automation_key
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+      key_label: "auto-settle"
+
+  # Both sides armed — assert each row independently via the role filter (the
+  # resolver returns a LIST; the harness picks the matching row).
+  - name: collect_status
+    type: deal_automation_status
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+      role: proposer
+
+  - name: assert_collect_armed
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      actual: "$collect_status.active"
+      equals: "True"
+
+  - name: settle_status
+    type: deal_automation_status
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+      role: tenant
+
+  - name: assert_settle_armed
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      actual: "$settle_status.active"
+      equals: "True"
+
+  # ═══════════════ 6 — THE WORKER RUNS (see caveat B) ═══════════════
+  # At this rental's 5s cadence (its plan's automation.cadence_seconds): tick N
+  # collects the due leg into group credit + opens the settlement swap (Branch
+  # L); a later tick completeSwaps it (Branch T). 120s covers many fast ticks +
+  # the on-chain settles.
+  - name: await_auto_cycle
+    type: sleep
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters: { seconds: 120 }
+
+  # ═══════════════ 7 — ASSERT THE WORKER SETTLED THE RENT ═══════════════
+  # The tenant's cash fell by exactly one rent (1000) vs the post-escrow
+  # baseline — proof Branch T auto-completed the settlement swap (the tenant
+  # paid the cash leg) with NO manual Settle click. DELTA assert (robust to
+  # prior balance / re-runs).
+  - name: tenant_cash_after_settle
+    type: balance
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { asset_id: aud-token-asset }
+
+  - name: assert_tenant_auto_settled
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      actual: "$tenant_cash_after_settle.private_balance"
+      minus:  "$tenant_cash_before_settle.private_balance"
+      equals: "-1000000000000000000000"
+
+  # The settlement cash lands as a PENDING payable for the group (the worker
+  # drives collect/swap/settle but not the group's final claim — same as the
+  # manual flow's explicit group_claim_settlement). The group pulls it via
+  # acceptAll (acting AS the group), then its private_balance reflects the rent.
+  - name: group_claim_settlement
+    type: wait_for_accept_all
+    user:
+      id: originator@yieldfabric.com
+      password: originator_password
+      group: "12 Smith St — Property Account $(cat /tmp/yf_rental_auto_nonce)"
+    parameters:
+      asset_id: aud-token-asset
+      idempotency_key: rental-auto-claim-$(cat /tmp/yf_rental_auto_nonce)
+
+  - name: await_claim_settle
+    type: sleep
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters: { seconds: 30 }
+
+  - name: group_cash_after
+    type: balance
+    user:
+      id: originator@yieldfabric.com
+      password: originator_password
+      group: "12 Smith St — Property Account $(cat /tmp/yf_rental_auto_nonce)"
+    parameters: { asset_id: aud-token-asset }
+
+  # The property account received exactly one rent — end-to-end receipt proof:
+  # tenant −1000 (auto-settled) AND property +1000, same 1000, all triggered by
+  # the worker. Fresh group per run ⇒ the absolute assert is safe.
+  - name: assert_property_received_rent
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      actual: "$group_cash_after.private_balance"
+      minus:  "$group_cash_before.private_balance"
+      equals: "1000000000000000000000"
+
+  # ═══════════════ 8 — KILL-SWITCH: revoke both sides ═══════════════
+  # Each party stops their own automation. The worker reads only ACTIVE
+  # credentials, so no further collect/settle fires for this rental.
+  - name: stop_collect
+    type: revoke_automation_key
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+
+  - name: stop_settle
+    type: revoke_automation_key
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+
+  - name: collect_status_after_revoke
+    type: deal_automation_status
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+      role: proposer
+
+  - name: assert_collect_stopped
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      actual: "$collect_status_after_revoke.active"
+      equals: "False"
+
+  - name: settle_status_after_revoke
+    type: deal_automation_status
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+      role: tenant
+
+  - name: assert_settle_stopped
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      actual: "$settle_status_after_revoke.active"
+      equals: "False"

@@ -1,0 +1,238 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  NFT-HOLDER POLICY EXECUTOR — AGENCY-RIGHTS TRANSFER SUITE  (Option B, #B)
+# ════════════════════════════════════════════════════════════════════════════
+#
+#  Proves the headline property of the NFT-holder policy-executor feature:
+#  the policy's EXECUTION right is a TRANSFERABLE BEARER credential — it follows
+#  whoever currently holds the "agency" obligation NFT, resolved LIVE via
+#  ownerOf at every executeUnderPolicy. Transfer the NFT → transfer the agency.
+#
+#  Runs against the LIVE runtime (Rust + circom + Solidity) via the Python harness:
+#    python -m yieldfabric.cli execute scripts/tests/rental_nft_executor_transfer_suite.yaml
+#  Assumes a FRESH deploy + `setup.yaml` seeded (users + groups with deployed
+#  accounts). The Solidity MUST be the NEW ConfidentialAccountImplementation that
+#  carries Policy.executors_id (this suite is meaningless against the old one).
+#
+#  MODEL (the rental "agency" mapped onto the policy primitive):
+#    G        = "Issuer Group"            — the PROPERTY group account; sends run ON G
+#    landlord = issuer (owner of G)       — registers + approves the send policy (the APPROVER)
+#    agent A  = collateral                — the FIRST managing agent; holds the agency NFT, executes
+#    agent B  = investor                  — the NEXT managing agent; named in NO policy, gains the
+#                                           right SOLELY by receiving the agency NFT
+#    agency NFT = a payment-less obligation in a TRANSFERABLE class, the EXECUTOR credential.
+#    On-chain isPolicyCaller(msg.sender = the executor's account I) authorizes when
+#    ownerOf(agency-collection, agency-tokenId) == I. So whichever account HOLDS the NFT is the
+#    executor; a transfer moves the right with NO policy re-registration.
+#
+#  ⚠️  TWO PREREQUISITES for this suite to PASS end-to-end (both tracked separately):
+#    (1) OFF-CHAIN delegation gate must be NFT-aware. The executor drives the relay→I→G
+#        executeUnderPolicy via a group-delegation JWT, minted by auth gated on
+#        `DataPoliciesOps::is_valid_policy_member(G, signer)`. That gate matches the signer's
+#        ADDRESS against the policy's executors. For an NFT-holder executor the executor slot is
+#        the COLLECTION address (not the holder), so the address match can't recognize the holder
+#        without an ownerOf chain read — which the DB layer can't do. Until is_valid_policy_member
+#        resolves ownerOf for NFT executor slots, steps `a_executes` / `b_executes` are DENIED at
+#        the delegation mint ("not a policy member"). On-chain isPolicyCaller is authoritative; this
+#        is purely the off-chain recognition needed so the holder can OBTAIN the delegation.
+#    (2) [RESOLVED] executor_ids carries the agency NFT's REAL on-chain tokenId, captured from the
+#        mint as `$mint_agency.token_id`. `create_obligation` generates the tokenId INDEPENDENTLY of a
+#        provided contract_id (the suffix of a provided contract_id is NOT the tokenId), so the suite
+#        must NOT hardcode it — the createObligation response now exposes `tokenId` for exactly this.
+#
+#  ⚠️  ENV CONSTANT — AUD token contract (chain-31337; change if your deploy differs):
+#      0x59b670e9fA9D0A427751Af201D676719a970857b
+# ════════════════════════════════════════════════════════════════════════════
+
+commands:
+
+  # ───────────────────────── SETUP / IDENTITY ─────────────────────────
+  - name: landlord_ctx     # issuer acting AS the property group → G, G's wallet id, issuer's account
+    type: whoami
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+
+  - name: landlord_self_ctx  # issuer's OWN wallet (the policy APPROVER in required_signers)
+    type: whoami
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+
+  - name: agent_a_ctx      # collateral's own account — FIRST agent, initial agency-NFT holder + executor
+    type: whoami
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+
+  - name: agent_b_ctx      # investor's own account — NEXT agent, gains the right only via the NFT
+    type: whoami
+    user: { id: investor@yieldfabric.com, password: investor_password }
+
+  # Fund the property group's confidential AUD so the policy's bounded sends have balance to move.
+  - name: fund_owner_aud
+    type: deposit
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { asset_id: aud-token-asset, amount: 1000000000000000000000, idempotency_key: nftx-fund-owner-$(date +%s) }
+  - name: fund_group_send
+    type: instant
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { asset_id: aud-token-asset, amount: 1000000000000000000000, destination_id: Issuer Group, idempotency_key: nftx-fund-group-$(date +%s) }
+  - name: fund_group_accept
+    type: accept_all
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { denomination: aud-token-asset, wait: true }
+
+  # ─────────────── 1 — DEPLOY A TRANSFERABLE "AGENCY" OBLIGATION CLASS ───────────────
+  # The agency NFT must live in a TRANSFERABLE class so agent A can hand it to agent B.
+  # open_minting:true lets agent A mint into it directly.
+  - name: deploy_agency
+    type: deploy_class
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters:
+      name: "Property Agency Credential"
+      symbol: AGENCY
+      open_minting: true
+      transferable: true
+      idempotency_key: nftx-agency-class-$(date +%s)
+  - name: assert_agency_class
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { actual: "$deploy_agency.obligation_address", contains: "0x" }
+
+  # ─────────────── 2 — AGENT A MINTS THE AGENCY NFT (holds it) ───────────────
+  # Self-counterpart + no initial_payments ⇒ the mint AUTO-ACCEPTS in one tx and agent A's account
+  # becomes the on-chain holder (ownerOf). Canonical contract_id pins the tokenId (see prereq #2).
+  - name: mint_agency
+    type: create_obligation
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters:
+      obligation_address: "$deploy_agency.obligation_address"
+      # No hardcoded contract_id: the resolver generates CONTRACT-OBLIGATION-<tokenId>, captured below as
+      # $mint_agency.contract_id / .token_id. Re-runnable (no fixed-id collision on a non-fresh DB), and
+      # assert_minted checks the BACKEND's id, not a literal the test handed in (closes the tautology).
+      counterpart: collateral@yieldfabric.com
+      # Portable: GNU `date -d` (Linux/CI) with a BSD `date -v` fallback (macOS) — never leaks the literal.
+      expiry: $(date -u -d '+365 days' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+365d +%Y-%m-%dT%H:%M:%SZ)
+      data: { name: "Agency NFT", description: "Bearer credential: the holder is the property agent (policy executor)" }
+      idempotency_key: nftx-mint-agency-$(date +%s)
+  - name: assert_minted
+    type: assert
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { actual: "$mint_agency.contract_id", contains: "CONTRACT-OBLIGATION-" }
+
+  # ─────────────── 3 — LANDLORD REGISTERS THE SEND POLICY, EXECUTOR = THE AGENCY NFT ───────────────
+  # executor_accounts[0] = the agency COLLECTION; executor_ids[0] = the agency tokenId. On-chain the
+  # executor is whoever holds (collection, tokenId). required_signers = the landlord (the approver).
+  - name: reg_policy
+    type: add_data_policy
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters:
+      account_address: $landlord_ctx.default_wallet_id
+      wallet_id: $landlord_ctx.default_wallet_id
+      policy_id: "770001"
+      expiry: "$(date -d '+365 days' +%s 2>/dev/null || date -v+365d +%s)"   # portable (GNU/BSD)
+      max_use: "10"
+      min_signatories: 1
+      required_signers: [ $landlord_self_ctx.default_wallet_id ]
+      executor_accounts: [ "$deploy_agency.obligation_address" ]   # the agency ERC-721 collection
+      executor_ids:      [ "$mint_agency.token_id" ]               # the agency NFT's REAL on-chain tokenId (from the mint)
+      allowed_operations: [ send ]
+      amount_bounds:
+        - { token: aud-token-asset, lo: "0", hi: "500000000000000000000" }
+      requirements:
+        - { source: 0, denomination: aud-token-asset, lo: "0", hi: "1000000000000000000000000000" }
+      idempotency_key: nftx-reg-$(date +%s)
+  - name: approve_policy
+    type: approve_data_policy
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { account: $landlord_ctx.group_account_address, policy_id: "770001" }
+
+  # ─────── 3.5 — A NEVER-WAS-HOLDER IS DENIED AT THE OFF-CHAIN GATE (distinct from the on-chain deny) ───────
+  # ★ THE OFF-CHAIN REVOCATION PROOF. payer never held the agency NFT, is not a group member, and is not
+  #   an executor. Requesting a group delegation to execute forces a FRESH delegation mint (no cached JWT),
+  #   so this exercises the OFF-CHAIN gate's DENY path: is_derived_policy_member → ownerOf(collection,
+  #   tokenId) != payer's account → false → 403 at the mint. The harness then falls back to payer's regular
+  #   (non-group) token, and the resolver rejects it with "acting as the group". The later
+  #   a_after_transfer_denied step proves the ON-CHAIN deny (former holder, cached JWT); THIS proves the
+  #   OFF-CHAIN deny (never-holder, fresh mint) — together both gates are covered.
+  - name: nonholder_denied
+    type: execute_under_policy
+    user: { id: payer@yieldfabric.com, password: payer_password, group: Issuer Group }
+    parameters:
+      account_address: $landlord_ctx.default_wallet_id
+      policy_id: "770001"
+      operation_type: Send
+      operation_data: { token_address: aud-token-asset, destination_id: payer@yieldfabric.com, amount: "100000000000000000000" }
+      idempotency_key: nftx-nonholder-$(date +%s)
+      expect_failure: true
+      expect_error: "acting as the group"
+
+  # Snapshot the property group's confidential AUD BEFORE the holder's send, so we can prove the bounded
+  # send ACTUALLY moves funds out of G (real movement, not just "message executed"). Read AS the group
+  # (issuer is G's owner, so the delegation is granted and G's confidential balance is decryptable).
+  - name: bal_g_before
+    type: balance
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { asset_id: aud-token-asset }
+
+  # ─────────────── 4 — AGENT A (the holder) EXECUTES THE POLICY → SUCCESS ───────────────
+  # collateral holds the agency NFT, so ownerOf(collection, 770001) == collateral's account == msg.sender.
+  # (Requires prereq #1 — the delegation mint must recognize the NFT holder off-chain.)
+  - name: a_executes
+    type: execute_under_policy
+    user: { id: collateral@yieldfabric.com, password: collateral_password, group: Issuer Group }
+    parameters:
+      account_address: $landlord_ctx.default_wallet_id
+      policy_id: "770001"
+      operation_type: Send
+      operation_data: { token_address: aud-token-asset, destination_id: collateral@yieldfabric.com, amount: "100000000000000000000" }
+      idempotency_key: nftx-a-exec-$(date +%s)
+
+  # ★ REAL FUND-MOVEMENT PROOF (not status-only): the bounded send must DEBIT the property group's
+  #   confidential AUD. Snapshot after, assert G's spendable balance strictly decreased.
+  - name: bal_g_after
+    type: balance
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { asset_id: aud-token-asset }
+  - name: assert_g_debited
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    # Directional (strictly decreased) — robust to whether the 100 AUD is fully spendable-debited vs
+    # partly locked pending the recipient's accept. TIGHTEN to an exact delta once a live run confirms
+    # the sender's debited field:  minus: "$bal_g_before.private_balance", equals: "100000000000000000000"
+    parameters: { actual: "$bal_g_after.private_balance", lt: "$bal_g_before.private_balance" }
+
+  # ─────────────── 5 — AGENT A TRANSFERS THE AGENCY NFT TO AGENT B ───────────────
+  - name: transfer_agency
+    type: transfer_obligation
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { contract_id: $mint_agency.contract_id, destination_id: investor@yieldfabric.com, idempotency_key: nftx-transfer-$(date +%s) }
+
+  # ─────────────── 6 — AGENT B (the NEW holder) EXECUTES THE POLICY → SUCCESS ───────────────
+  # ★ THE TRANSFERABILITY PROOF: investor is named in NO policy, yet now executes G's send policy
+  #   PURELY because it holds the agency NFT. ownerOf(collection, 770001) == investor's account now.
+  - name: b_executes
+    type: execute_under_policy
+    user: { id: investor@yieldfabric.com, password: investor_password, group: Issuer Group }
+    parameters:
+      account_address: $landlord_ctx.default_wallet_id
+      policy_id: "770001"
+      operation_type: Send
+      operation_data: { token_address: aud-token-asset, destination_id: investor@yieldfabric.com, amount: "100000000000000000000" }
+      idempotency_key: nftx-b-exec-$(date +%s)
+
+  # ─────────────── 7 — AGENT A (former holder) EXECUTES → REJECTED ───────────────
+  # ★ THE REVOCATION-BY-TRANSFER PROOF: collateral no longer holds the NFT, so on-chain isPolicyCaller
+  #   resolves ownerOf(collection, 770001) == investor != collateral → NotAuthorizedPolicyCaller. The
+  #   right MOVED; it did not duplicate. (Surfaces at the delegation mint once prereq #1 lands, or at the
+  #   on-chain executor gate if the delegation is granted on a stale projection.)
+  - name: a_after_transfer_denied
+    type: execute_under_policy
+    user: { id: collateral@yieldfabric.com, password: collateral_password, group: Issuer Group }
+    parameters:
+      account_address: $landlord_ctx.default_wallet_id
+      policy_id: "770001"
+      operation_type: Send
+      operation_data: { token_address: aud-token-asset, destination_id: collateral@yieldfabric.com, amount: "100000000000000000000" }
+      idempotency_key: nftx-a-after-$(date +%s)
+      # Negative test. The revert surfaces ASYNC via message-status polling (the GraphQL
+      # mutation returns 200; the on-chain executor reverts), so BOTH flags must live INSIDE
+      # `parameters` — the runner reads command.parameters.get("expect_failure"/"expect_error")
+      # (runner.py:189-205). expect_failure marks "a failed command counts as PASS"; expect_error
+      # asserts the substring. Same shape as datapolicy_comprehensive_suite's DataRequirementNotMet.
+      expect_failure: true
+      expect_error: "NotAuthorizedPolicyCaller"

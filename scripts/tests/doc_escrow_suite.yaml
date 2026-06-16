@@ -1,0 +1,249 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  DOCUMENT ESCROW — RELEASE GATED BY A NEUTRAL ATTESTOR'S ZK DOCUMENT
+# ════════════════════════════════════════════════════════════════════════════
+#
+#  The substrate proof behind the `doc_escrow` deal template
+#  (yieldfabric-dms/templates/doc_escrow). A payer escrows funds; a beneficiary
+#  can claim them ONLY once a neutral attestor certifies a condition by
+#  committing a confidential document whose value falls inside an agreed range —
+#  proven in zero knowledge on-chain (AlphaNumericalData / DataVerifier). The
+#  attested value stays private; only "in range" is proven.
+#
+#  WHAT THIS ADDS over datapolicy_oracle_suite.yaml:
+#    datapolicy_oracle_suite proves the source-3 oracle requirement with the
+#    obligor (document committer) == the policy account owner (issuer, acting as
+#    the group). THIS suite proves the ESCROW shape: the obligor is a NEUTRAL
+#    EXTERNAL ATTESTOR — a third party that owns NEITHER the escrow account NOR
+#    the approval — whose committed document gates a release from the payer's
+#    escrow account to a DISTINCT beneficiary. Plus balance CONSERVATION:
+#    escrow debited == beneficiary credited, by exactly the released amount.
+#
+#  MODEL (three distinct parties on the proven data-policy primitive):
+#    G          = the ESCROW account ("Issuer Group"). The payer funds it; the
+#                 beneficiary collects FROM it under the doc-gated send policy.
+#    payer      = issuer (OWNS G; funds it; registers + approves the release
+#                 policy). The escrow's depositor / proposer.
+#    beneficiary= collateral (the policy EXECUTOR — a derived policy-member;
+#                 releases the escrow to itself once the gate passes).
+#    attestor   = investor (NEUTRAL CERTIFIER — owns neither G nor the approval;
+#                 commits the ZK document at ITS OWN oracle slot. The release
+#                 requirement names this account as `obligor`).
+#
+#  WHY A NEUTRAL ATTESTOR MATTERS: the release condition is certified by someone
+#  who is not the payer and not the beneficiary — so neither transacting party
+#  can unilaterally unlock the funds. Only the attestor's in-range, committed
+#  document opens the gate.
+#
+#  ENFORCEMENT (mirrors datapolicy_oracle_suite, confirmed by run):
+#    • in-range document  → policy registers, approves, executes → funds release.
+#    • out-of-range doc   → server-derive zeroes the vIdHash → on-chain
+#                           addDataPolicy reverts InvalidDataRequirement: the
+#                           escrow CANNOT be locked against an uncertified
+#                           condition (the lock proof, section NEG).
+#
+#  oracle_query SYNTAX: a constraint is the {min,max} object form
+#    '{"constraints": {"condition_score": {"min": 80, "max": 100}}}'.
+#  Inclusive bounds; numeric range is 36-bit (0 … 68,719,476,735).
+#
+#  HARNESS: needs NO new commands — every verb (commit_oracle_document,
+#  add_data_policy, approve_data_policy, execute_under_policy, balance, assert,
+#  deposit, instant, accept_all) is already wired. Run:
+#    PYTHONPATH=. python -m yieldfabric.cli execute \
+#      ../scripts/tests/doc_escrow_suite.yaml
+#  Fresh deploy + setup.yaml (issuer/collateral/investor seeded; collateral a
+#  member of Issuer Group), all 3 services up. AUD token = aud-token-asset.
+#  Doc keys 96xx, policy IDs per-run-unique (nonce in /tmp/yf_docesc_nonce).
+# ════════════════════════════════════════════════════════════════════════════
+
+commands:
+
+  # ───────────────────────── IDENTITY ─────────────────────────
+  - name: payer_ctx          # PAYER / escrow owner: owns G, funds it, registers + approves the policy
+    type: whoami
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+  - name: payer_self_ctx     # issuer's OWN wallet — the policy approver / required signer
+    type: whoami
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+  - name: beneficiary_ctx    # BENEFICIARY: the policy executor / payee (a derived policy-member of G)
+    type: whoami
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+  - name: attestor_ctx       # NEUTRAL ATTESTOR: owns neither G nor the approval; commits the cert doc at its OWN slot
+    type: whoami
+    user: { id: investor@yieldfabric.com, password: investor_password }
+
+  # ───────── FUND THE ESCROW (the payer escrows 1000 AUD into G) ─────────
+  - name: fund_payer
+    type: deposit
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { asset_id: aud-token-asset, amount: 1000000000000000000000, idempotency_key: de-fund-$(date +%s | tee /tmp/yf_docesc_nonce) }
+  - name: pay_into_escrow
+    type: instant
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { asset_id: aud-token-asset, amount: 1000000000000000000000, destination_id: Issuer Group, idempotency_key: de-payin-$(cat /tmp/yf_docesc_nonce) }
+  - name: escrow_accept
+    type: accept_all
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { denomination: aud-token-asset, wait: true }
+
+  # ═══════════ 1 — ATTESTOR CERTIFIES (in-range document at its OWN oracle slot) ═══════════
+  # The NEUTRAL attestor (investor) commits {"condition_score": 95} at obligor =
+  # ITS OWN account, key 9600. 95 ∈ [80,100], so the release policy can freeze a
+  # satisfiable constraint commitment from it.
+  - name: attestor_commit
+    type: commit_oracle_document
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { obligor: $attestor_ctx.default_wallet_id, key: "9600", document_json: '{"condition_score": 95}', idempotency_key: de-commit-$(cat /tmp/yf_docesc_nonce) }
+
+  # ═══════════ 2 — PAYER REGISTERS the doc-gated release policy on G ═══════════
+  # executor = the beneficiary's wallet (plain-wallet executor); the source-3
+  # requirement names the ATTESTOR's account as `obligor` (the neutral certifier).
+  # amount_bounds caps each release at 500 AUD.
+  - name: register_release
+    type: add_data_policy
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters:
+      account: $payer_ctx.default_wallet_id
+      wallet_id: $payer_ctx.default_wallet_id
+      policy_id: "$(cat /tmp/yf_docesc_nonce)50"
+      expiry: "$(date -d '+365 days' +%s 2>/dev/null || date -v+365d +%s)"
+      max_use: "1"
+      min_signatories: 1
+      required_signers: [ $payer_self_ctx.default_wallet_id ]
+      executor_accounts: [ $beneficiary_ctx.default_wallet_id ]
+      allowed_operations: [ send ]
+      amount_bounds:
+        - { token: aud-token-asset, lo: "0", hi: "500000000000000000000" }
+      requirements:
+        - source: 3
+          obligor: $attestor_ctx.default_wallet_id     # the NEUTRAL attestor's account (not G, not the approver)
+          token_id: "9600"
+          oracle_query: '{"constraints": {"condition_score": {"min": 80, "max": 100}}}'
+      idempotency_key: de-reg-$(cat /tmp/yf_docesc_nonce)
+
+  # ═══════════ 3 — PAYER APPROVES the policy ═══════════
+  # REDUNDANT in this configuration: the payer is the policy registrar AND the
+  # sole required signer, so the registrar's approval is auto-collected at
+  # registration (see the "Registrar approval auto-recorded" log line — the
+  # policy is already approved=true before this call). Kept here to exercise
+  # approve_data_policy explicitly; the `doc_escrow` template omits it because
+  # the auto-approve makes the escrow self-driving. (Add an explicit approve only
+  # when required_signers includes parties OTHER than the registrar.)
+  - name: approve_release
+    type: approve_data_policy
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { account: $payer_ctx.default_wallet_id, policy_id: "$(cat /tmp/yf_docesc_nonce)50" }
+
+  # ═══════════ 4 — BALANCES BEFORE RELEASE ═══════════
+  - name: escrow_before
+    type: balance
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { asset_id: aud-token-asset }
+  - name: beneficiary_before
+    type: balance
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { asset_id: aud-token-asset }
+
+  # ═══════════ 5 — BENEFICIARY RELEASES the escrow (executeUnderPolicy Send → self) ═══════════
+  # Gated on the attestor's committed, in-range document. The server reads the
+  # document server-side, rebuilds the DataVerifier proof, and the on-chain gate
+  # enforces executor + amount bound + the ZK range before the Send fires.
+  - name: release
+    type: execute_under_policy
+    user: { id: collateral@yieldfabric.com, password: collateral_password, group: Issuer Group }
+    parameters:
+      account: $payer_ctx.default_wallet_id
+      policy_id: "$(cat /tmp/yf_docesc_nonce)50"
+      operation_type: Send
+      operation_data: { token_address: aud-token-asset, destination_id: collateral@yieldfabric.com, amount: "300000000000000000000" }
+      idempotency_key: de-exec-$(cat /tmp/yf_docesc_nonce)
+
+  - name: release_settle
+    # Let the Send settle on G (debit) and the incoming payment land for the
+    # beneficiary before accepting. Confidential send + ZK settle observed ~6s.
+    type: sleep
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { seconds: 15 }
+
+  # ═══════════ 6 — BENEFICIARY ACCEPTS the released payment + settle ═══════════
+  - name: beneficiary_accept
+    type: accept_all
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { denomination: aud-token-asset, wait: true }
+  - name: beneficiary_settle
+    # accept_all's `wait` covers the on-chain accept; the follow-on retrieve that
+    # credits the spendable balance settles a few seconds later (observed ~6s).
+    type: sleep
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { seconds: 20 }
+
+  # ═══════════ 7 — CONSERVATION ASSERTS (escrow debited == beneficiary credited == 300) ═══════════
+  - name: escrow_after
+    type: balance
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { asset_id: aud-token-asset }
+  - name: beneficiary_after
+    type: balance
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { asset_id: aud-token-asset }
+
+  - name: assert_escrow_debited
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      # EXACT: G fell by EXACTLY the released amount (300 AUD) — the escrow paid out
+      # once, gated by the attestor's certification.
+      actual: "$escrow_before.private_balance"
+      minus: "$escrow_after.private_balance"
+      equals: "300000000000000000000"
+  - name: assert_beneficiary_credited
+    type: assert
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters:
+      # EXACT: the beneficiary's spendable balance ROSE by EXACTLY 300 AUD — the
+      # release DELIVERED spendable funds, and the amount matches the G debit
+      # (conservation: G_debit == beneficiary_credit).
+      actual: "$beneficiary_after.private_balance"
+      minus: "$beneficiary_before.private_balance"
+      equals: "300000000000000000000"
+  - name: assert_beneficiary_no_leak
+    type: assert
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters:
+      # LEAK GUARD: nothing left unaccepted — the beneficiary accepted the whole release.
+      actual: "$beneficiary_after.locked_in"
+      equals: "[]"
+
+  # ═══════════ NEG — AN OUT-OF-RANGE CERTIFICATION CANNOT LOCK THE ESCROW ═══════════
+  # The lock proof: if the attestor's document does NOT satisfy the condition, the
+  # payer cannot even register the release policy — the server-derive runs the
+  # asserting proof, 50 ∉ [80,100] zeroes the vIdHash, and on-chain addDataPolicy
+  # reverts InvalidDataRequirement. So the escrow can't be opened against an
+  # uncertified condition. (Twin of datapolicy_oracle_suite section B.)
+  - name: attestor_commit_bad
+    type: commit_oracle_document
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { obligor: $attestor_ctx.default_wallet_id, key: "9601", document_json: '{"condition_score": 50}', idempotency_key: de-commit-bad-$(cat /tmp/yf_docesc_nonce) }
+
+  - name: register_release_bad
+    type: add_data_policy
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters:
+      account: $payer_ctx.default_wallet_id
+      wallet_id: $payer_ctx.default_wallet_id
+      policy_id: "$(cat /tmp/yf_docesc_nonce)51"
+      expiry: "$(date -d '+365 days' +%s 2>/dev/null || date -v+365d +%s)"
+      max_use: "1"
+      min_signatories: 1
+      required_signers: [ $payer_self_ctx.default_wallet_id ]
+      executor_accounts: [ $beneficiary_ctx.default_wallet_id ]
+      allowed_operations: [ send ]
+      amount_bounds:
+        - { token: aud-token-asset, lo: "0", hi: "500000000000000000000" }
+      requirements:
+        - source: 3
+          obligor: $attestor_ctx.default_wallet_id
+          token_id: "9601"                              # the {"condition_score": 50} doc — out of [80,100]
+          oracle_query: '{"constraints": {"condition_score": {"min": 80, "max": 100}}}'
+      idempotency_key: de-reg-bad-$(cat /tmp/yf_docesc_nonce)
+      expect_failure: true                              # negative-test flags live in `parameters`
+      expect_error: "InvalidDataRequirement"

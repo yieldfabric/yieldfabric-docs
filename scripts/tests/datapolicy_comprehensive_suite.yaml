@@ -31,9 +31,11 @@
 #    resolver fast-fail   : "not fully approved" / "caller set" / "GROUP accounts" /
 #                           "no committed document"
 #    backend pre-check    : "allowed calls (target/selector mismatch)"   (wrong op)
-#    on-chain (ZK proof)  : WhoMismatch        (over-bound CONFIDENTIAL send; out-of-range source-0
-#                                               balance — both ride the BalanceAssert proof, whose
-#                                               `who` signal goes garbage when the witness is unsat)
+#    vault pre-flight     : "policy balance requirement not met" (out-of-range source-0 balance) /
+#                           "policy amount bound not met" (over-bound CONFIDENTIAL send) — both ride
+#                           the BalanceAssert proof, whose `who` signal goes garbage when the witness
+#                           is unsat, so the vault refuses in plaintext at witness-build time with the
+#                           real reason. On-chain backstop if bypassed: WhoMismatch.
 #    on-chain (plaintext) : AmountAboveMax     (over-bound PUBLIC deposit/withdraw amount)
 #    on-chain authorize   : PolicyNotStarted / PolicyExpired / PolicyMaxUseExceeded
 #                           DataRequirementNotMet   (direct-read source-1 PublicBalance / source-2 NFT)
@@ -42,7 +44,7 @@
 #    Membership (Part 1) : M1 register⇒act ; M2 non-named user denied
 #    Validity gate (P2)  : G1 member reads the GROUP balance acting-as-group (valid ⇒ allowed)
 #    Sources             : S0 PrivateVault sat+unsat ; S1 PublicBalance unsat ; S3 Oracle sat+nodoc
-#    Operations × amount : Send (in-bound + over⇒WhoMismatch) ; Withdraw (over⇒AmountAboveMax) ; wrong-op
+#    Operations × amount : Send (in-bound + over⇒"policy amount bound not met") ; Withdraw (over⇒AmountAboveMax) ; wrong-op
 #    Approval / M-of-N   : 1-of-1 ; 2-of-2 sat ; 2-of-2 partial ; non-signer
 #    Lifecycle           : not-started ; expired ; max-use ; before-approval
 #    Registration guards : non-group ; zero-threshold PublicBalance
@@ -165,9 +167,11 @@ commands:
   #
   # S0-UNSAT: a source-0 requirement whose [lo, hi] the group's balance does NOT satisfy (lo far
   # above the ~900 AUD balance). source-0 is a ZK BalanceAssert proof, so an out-of-range balance is
-  # UNSATISFIABLE → the proof's `who` public signal is garbage → on-chain WhoMismatch (same mechanism
-  # as an over-bound confidential amount). The send AMOUNT (100) is within the amount bound — it's the
-  # REQUIREMENT that fails.
+  # UNSATISFIABLE. The vault PRE-FLIGHTS this in plaintext at witness-build time
+  # (execute_policy.rs::build_witnesses) and refuses with the real reason — "policy balance
+  # requirement not met … top the account up" — instead of letting a garbage `who` public signal go
+  # on-chain and revert with the misleading WhoMismatch (which is still the on-chain backstop). The
+  # send AMOUNT (100) is within the amount bound — it's the REQUIREMENT that fails.
   - name: s0_unsat_add
     type: add_data_policy
     user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
@@ -203,8 +207,9 @@ commands:
       operation_data: { token_address: aud-token-asset, destination_id: collateral@yieldfabric.com, amount: "100000000000000000000" }
       idempotency_key: cmp-9002-exec-bad-$(date +%s)
       expect_failure: true
-      # source-0 BalanceAssert proof is unsatisfiable (balance ∉ [lo,hi]) ⇒ garbage `who` ⇒ WhoMismatch.
-      expect_error: "WhoMismatch"
+      # source-0 BalanceAssert proof is unsatisfiable (balance ∉ [lo,hi]) ⇒ caught by the plaintext
+      # pre-flight before any proof/chain call. (On-chain backstop if the pre-flight were bypassed: WhoMismatch.)
+      expect_error: "policy balance requirement not met"
 
   # S1 (PublicBalance, direct ERC-20 read) UNSATISFIED: require an absurd raw ERC-20 balance the
   # group can't have (its AUD is CONFIDENTIAL in the vault, raw balance ~0) ⇒ direct read fails ⇒
@@ -254,7 +259,11 @@ commands:
 
   # ════════════════════ OPERATIONS × AMOUNT BOUNDS ════════════════════
   # Over-bound CONFIDENTIAL send (reuse P9001, hi=500): amount is private ⇒ enforced by a ZK
-  # amount-range proof; 600 ∉ [0,500] ⇒ unsatisfiable ⇒ WhoMismatch (NOT plaintext AmountAboveMax).
+  # amount-range proof; 600 ∉ [0,500] ⇒ unsatisfiable. The vault pre-flights the send amount against
+  # the bound in plaintext (execute_policy.rs::build_witnesses, is_confidential_send branch) and
+  # refuses with "policy amount bound not met" before generating a garbage proof that would otherwise
+  # revert on-chain with the misleading WhoMismatch (still the on-chain backstop). NOT plaintext
+  # AmountAboveMax — that's the WITHDRAW path below, where the amount is public in calldata.
   - name: op_send_over_bound
     type: execute_under_policy
     user: { id: collateral@yieldfabric.com, password: collateral_password, group: Issuer Group }
@@ -265,7 +274,7 @@ commands:
       operation_data: { token_address: aud-token-asset, destination_id: collateral@yieldfabric.com, amount: "600000000000000000000" }
       idempotency_key: cmp-9001-over-bad-$(date +%s)
       expect_failure: true
-      expect_error: "WhoMismatch"
+      expect_error: "policy amount bound not met"
 
   # Over-bound PUBLIC withdraw: a policy BOUND to withdraw, amount in [0, 500]. Withdraw's amount is
   # PLAINTEXT in calldata ⇒ enforced by the direct AmountAboveMax check (the OTHER amount-bound path,
@@ -400,6 +409,12 @@ commands:
 
   # ════════════════════════════ LIFECYCLE ════════════════════════════
   # Before approval: P9007 registered but NOT approved → execute → "not fully approved".
+  # NB: add_data_policy AUTO-RECORDS the registrar's own approval when the registrar (here issuer,
+  # acting as the group) is itself in the policy's approver set (the "registered ⇒ signed ⇒
+  # executor-ready" rental property — pipeline_gate.rs::auto_approve_registrar_signature). To get a
+  # genuinely UNAPPROVED policy, the sole required signer is the PAYER (NOT the issuer-registrar), so
+  # the auto-record is skipped (best-effort, non-fatal) and the policy sits at 0/1 until
+  # life_maxuse_approve (the payer) signs below.
   - name: life_unapproved_add
     type: add_data_policy
     user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
@@ -410,7 +425,7 @@ commands:
       expiry: "$(date -v+365d +%s)"
       max_use: "1"
       min_signatories: 1
-      required_signers: [ $owner_self_ctx.default_wallet_id ]
+      required_signers: [ $approver2_ctx.default_wallet_id ]   # payer (NOT the issuer-registrar) ⇒ no auto-approval
       executor_accounts: [ $member_ctx.default_wallet_id ]
       allowed_operations: [ send ]
       amount_bounds:
@@ -432,9 +447,11 @@ commands:
       expect_error: "not fully approved"
 
   # Max-use: approve P9007 (max_use 1), execute once (ok), execute again → PolicyMaxUseExceeded.
+  # Approve as the PAYER — the sole required signer of P9007 (see life_unapproved_add); the issuer
+  # is the registrar but deliberately NOT in this policy's approver set.
   - name: life_maxuse_approve
     type: approve_data_policy
-    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    user: { id: payer@yieldfabric.com, password: payer_password }
     parameters: { account: $owner_ctx.group_account_address, policy_id: "$(cat /tmp/yf_cmp_nonce)07" }
 
   - name: life_maxuse_first_ok

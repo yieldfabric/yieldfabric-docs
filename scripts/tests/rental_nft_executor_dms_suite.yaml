@@ -1,0 +1,459 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  NFT-HOLDER POLICY EXECUTOR — AGENCY-RIGHTS, THROUGH THE DMS DEAL FLOW
+# ════════════════════════════════════════════════════════════════════════════
+#
+#  The DMS counterpart to rental_nft_executor_transfer_suite.yaml. That suite
+#  drives the SUBSTRATE verbs directly (create_obligation / add_data_policy /
+#  execute_under_policy / transfer_obligation as standalone GraphQL on payments
+#  :3002). THIS suite drives the SAME agency-rights flow THROUGH THE DEAL DAG on
+#  the agents service (:3001 `dealFlow { … }`): a deal is proposed from an inline
+#  DealPlan, signed by both agent counterparties, then each on-chain step is
+#  executed by its assignee via `execute_step`.
+#
+#  WHY THIS EXISTS (what the DMS path proves that the direct suite cannot):
+#  the rental "deal" template (yieldfabric-app rentalModel.ts) wires the send
+#  policy's NFT executor from the MINTED agency NFT's outputs —
+#    executor_accounts: [ $step.mint_agency.obligation_address ]
+#    executor_ids:      [ $step.mint_agency.token_id ]
+#  Those cross-step refs only resolve because `create_composed_contract` now
+#  EXPOSES `token_id` + `obligation_address` (first leg) AND the payment-bridge
+#  lift-loop CAPTURES them (the work this suite end-to-end-proves). The direct
+#  suite hands the policy a token id it captured itself; HERE the deal runtime
+#  must thread the minted NFT's real on-chain id into the policy with no harness
+#  help. If the bridge capture regresses, `register_send_policy` registers a
+#  policy whose executor id is empty/zero and `a_executes` (the holder) is
+#  denied — the deal never reaches Completed.
+#
+#  MODEL (the rental "agency" mapped onto the policy primitive, via a deal):
+#    G        = "Issuer Group"          — the PROPERTY group account; sends run ON G.
+#                                         Pre-existing + FUNDED OUT-OF-BAND below.
+#    landlord = issuer (deal PROPOSER; owns G) — mints the agency NFT TO G, hands
+#                                         it to agent A, registers + (auto-)approves
+#                                         the send policy. Registrar == sole required
+#                                         signer ⇒ the policy auto-approves at
+#                                         registration (no approve step — same as
+#                                         doc_escrow_dms_suite).
+#    agent A  = collateral (deal party) — the FIRST managing agent; receives the
+#                                         agency NFT, executes the policy, then hands
+#                                         the NFT to agent B.
+#    agent B  = investor (deal party)   — the NEXT managing agent; named in NO
+#                                         policy, gains the execute-right SOLELY by
+#                                         receiving the agency NFT.
+#    payer    = payer (NOT a party)     — never holds the NFT; used post-deal to
+#                                         prove the off-chain non-holder deny.
+#    agency NFT = a payment-less obligation in a TRANSFERABLE class (deployed
+#                 out-of-band so A can re-transfer it to B), the EXECUTOR credential.
+#    On-chain isPolicyCaller(msg.sender = the executor's account I) authorizes when
+#    ownerOf(agency-collection, agency-tokenId) == I. Whichever account HOLDS the
+#    NFT is the executor; a transfer moves the right with NO policy re-registration.
+#
+#  DEAL DAG (inline plan — all-positive; the negatives can't be deal nodes):
+#    mint_agency (G self-mint, auto-accept)            ── proposer
+#         │
+#         ▼
+#    transfer_to_agent_a  (G → agent A)                ── proposer / acting_as G
+#         │
+#         ▼
+#    register_send_policy (NFT executor = $step.mint_agency.{obligation_address,
+#         │                token_id}; required_signer = landlord ⇒ auto-approve)  ── proposer
+#         ▼
+#    agent_a_executes     (A, the holder, Send G→A)    ── party agent_a / acting_as G
+#         │                ★ proves the off-chain ownerOf gate + the bridge capture
+#         ▼
+#    transfer_a_to_b      (A → agent B)                ── party agent_a
+#         │
+#         ▼
+#    agent_b_executes     (B, the NEW holder, Send G→B)── party agent_b / acting_as G
+#                          ★ THE TRANSFERABILITY PROOF: B is in no policy, yet executes
+#
+#  Deal reaching COMPLETED == the full positive transferable-executor chain ran
+#  THROUGH THE DMS. The two NEGATIVES (never-holder, former-holder) run POST-DEAL
+#  as direct execute_under_policy with expect_failure (a failing node would fail
+#  the whole deal, so they cannot live in the DAG).
+#
+#  ──────────────────────────────────────────────────────────────────────────
+#  STATUS — 2026-06-16: PASSES end-to-end (confirmed live), AND it CAUGHT A REAL SILENT
+#  BACKEND BUG on the way there. Full DMS chain green: propose → both signs → ACTIVE →
+#  mint_agency → transfer_to_agent_a → register_send_policy → agent_a_executes →
+#  transfer_a_to_b → agent_b_executes (agent B executes purely by holding the transferred
+#  NFT), plus the fund-movement assert and the two post-deal negatives. THE BUG it exposed:
+#  the bridge's `addDataPolicy` field map dropped `executor_ids`, so the policy registered
+#  with the agency COLLECTION but no token id → on-chain executors_id="0" → empty
+#  `data_policies` NFT slot → the off-chain delegation gate
+#  (is_valid_policy_member_or_nft_holder → valid_nft_executor_slots → ownerOf) could not
+#  recognise the holder → 403 → executeUnderPolicy denied. So the deal-authored NFT executor
+#  was SILENTLY non-functional (the direct suite masks this — its policy_executor maps
+#  executorIds). FIX: added `("executorIds","executor_ids")` to payment_bridge.rs's
+#  addDataPolicy map (+ a delegation-mint error that surfaces the real status instead of a
+#  cryptic JSON-parse EOF). An earlier 28/29 run's agent_a_executes had passed via a stale
+#  group-membership grant, NOT the NFT bearer — so it never truly exercised the executor
+#  until this fix; this DMS suite is what surfaced the gap a direct-substrate suite can't.
+#
+#  Remaining first-run confirmations (each flagged inline):
+#    (A) [CONFIRMED] PER-STEP DEFERRAL. Every node has a named assignee and is driven by an
+#        explicit `execute_step` (mint/transfer/register confirmed settling, no auto-advance).
+#    (B) BRIDGE AMOUNT SCALING. Deal-node execute_under_policy `amount` is HUMAN
+#        ("100" ⇒ 100 AUD; the bridge scales to wei). amount_bounds in the policy
+#        are RAW wei. The post-deal DIRECT negatives use the policy_executor's
+#        nested `operation_data.amount` in RAW wei (matching the direct suite).
+#    (C) ACCOUNT-ADDRESS FORM. register_send_policy + the releases address G as
+#        `group_account_address` (the doc_escrow DMS-proven form). The post-deal
+#        DIRECT negatives reuse the SAME group_account_address so the policy is
+#        found at the same on-chain account (precise expect_error guards against a
+#        wrong-reason pass — a "policy not found" would NOT match "acting as the
+#        group" and the runner would flag it). If the direct policy_executor
+#        rejects the 0x form, switch the two negatives to
+#        `$landlord_ctx.default_wallet_id` AND confirm it resolves to the same
+#        group account the deal registered on.
+#    (D) FORMER-HOLDER ERROR SURFACE. After the in-deal A→B transfer, agent A's
+#        post-deal direct execute is a FRESH delegation mint (the deal's
+#        agent_a_executes used a server-side delegation, not a harness-cached one),
+#        so the off-chain gate denies → "acting as the group". If a cached/stale
+#        group delegation is instead granted to the former holder, it surfaces
+#        on-chain as "NotAuthorizedPolicyCaller" — widen the expect_error then.
+#        (The on-chain NotAuthorizedPolicyCaller revert is already exhaustively
+#        proven by the DIRECT suite; here the off-chain ownerOf revocation is the
+#        point.)
+#    (E) SETTLE WAITS. The mint must settle before the transfer; the transfer +
+#        the policy registration must settle + project before the holder's execute
+#        resolves ownerOf off-chain. The sleeps are sized from the command-suite's
+#        observed settles (~6–15s); lengthen if a balance/deny assert races.
+#
+#  REQUIREMENTS: all three services up — auth (:3000), payments (:3002), agents
+#  (:3001) running the build that carries Policy.executors_id + the create_composed_
+#  contract token_id/obligation_address outputs + the bridge lift of both. Parties
+#  seeded (issuer/collateral/investor/payer); collateral + investor reachable as
+#  transfer destinations. Run (from yieldfabric-docs/python):
+#    PYTHONPATH=. python -m yieldfabric.cli execute \
+#      ../scripts/tests/rental_nft_executor_dms_suite.yaml
+# ════════════════════════════════════════════════════════════════════════════
+
+commands:
+
+  # ───────────────────────── IDENTITY ─────────────────────────
+  - name: landlord_ctx       # issuer acting AS the property group → G (group_id, group account, G's wallet)
+    type: whoami
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+  - name: landlord_self_ctx  # issuer's OWN wallet — the policy's required signer / approver
+    type: whoami
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+  - name: agent_a_ctx        # collateral — FIRST agent, receives the agency NFT, executes, then hands to B
+    type: whoami
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+  - name: agent_b_ctx        # investor — NEXT agent, gains the right only via the NFT
+    type: whoami
+    user: { id: investor@yieldfabric.com, password: investor_password }
+
+  # ───────── FUND THE PROPERTY GROUP OUT-OF-BAND (proven substrate path) ─────────
+  # 1000 AUD made SPENDABLE in G (deposit → instant → group accept_all). The deal's
+  # two bounded sends release 100 each out of it. (Seeds the per-run nonce.)
+  - name: fund_owner_aud
+    type: deposit
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { asset_id: aud-token-asset, amount: 1000000000000000000000, idempotency_key: nftdms-fund-$(date +%s | tee /tmp/yf_agency_dms_nonce) }
+  - name: fund_group_send
+    type: instant
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { asset_id: aud-token-asset, amount: 1000000000000000000000, destination_id: Issuer Group, idempotency_key: nftdms-payin-$(cat /tmp/yf_agency_dms_nonce) }
+  - name: fund_group_accept
+    type: accept_all
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { denomination: aud-token-asset, wait: true }
+
+  # ───────── DEPLOY A TRANSFERABLE "AGENCY" OBLIGATION CLASS (out-of-band) ─────────
+  # The agency NFT must live in a TRANSFERABLE class so agent A can re-transfer it
+  # to agent B. open_minting:true so the group can mint into it. Captured as
+  # $deploy_agency.obligation_address and threaded into the deal's mint node.
+  - name: deploy_agency
+    type: deploy_class
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters:
+      name: "Property Agency Credential (DMS)"
+      symbol: AGENCYD
+      open_minting: true
+      transferable: true
+      idempotency_key: nftdms-agency-class-$(cat /tmp/yf_agency_dms_nonce)
+  - name: assert_agency_class
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { actual: "$deploy_agency.obligation_address", contains: "0x" }
+
+  # ═══════════════ 1 — LANDLORD PROPOSES THE AGENCY DEAL (inline DealPlan) ═══════════════
+  # `$step.<id>.<out>` refs are resolved by the DEAL runtime (not the harness), so
+  # they pass through literally, quoted. `$<whoami>.<field>` refs ARE harness-
+  # substituted before submit. account_address points at the pre-existing,
+  # pre-funded Issuer Group account.
+  - name: propose_agency
+    type: propose_deal
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      name: "Property Agency (DMS) $(cat /tmp/yf_agency_dms_nonce)"
+      parties:
+        - { entity_id: $agent_a_ctx.user_id, role: agent_a }
+        - { entity_id: $agent_b_ctx.user_id, role: agent_b }
+      idempotency_key: nftdms-propose-$(cat /tmp/yf_agency_dms_nonce)
+      plan:
+        entry_step_ids: [mint_agency]
+        agreement_metadata:
+          governing_law: "New South Wales"
+          jurisdiction: "Sydney, Australia"
+          platform_terms_version: "1.0.0"
+        nodes:
+          # G self-mints the agency credential into the TRANSFERABLE class. Self-
+          # counterpart + no payment_schedule ⇒ the mint AUTO-ACCEPTS in one tx and
+          # G is the on-chain holder. The first (only) leg's token_id +
+          # obligation_address become $step.mint_agency.{token_id,obligation_address}.
+          - step_id: mint_agency
+            task_name: create_composed_contract
+            assignee_override: { kind: proposer }
+            inputs:
+              name: "Property Agency $(cat /tmp/yf_agency_dms_nonce)"
+              description: "Transferable agency credential — whoever holds it is the property managing agent (the policy executor)."
+              acting_as_group: $landlord_ctx.group_id
+              counterpart: $landlord_ctx.group_id
+              obligation_address: $deploy_agency.obligation_address
+              obligations:
+                - name: "Agency Credential"
+                  denomination: aud-token-asset
+                  expiry: "$(date -u -d '+365 days' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+365d +%Y-%m-%dT%H:%M:%SZ)"
+                  data: { name: "Agency NFT", description: "Bearer credential: the holder is the property agent (policy executor)" }
+          # G hands the credential to agent A. acting_as_group G; the bundle's
+          # composed_contract_id auto-resolves the per-class address at transfer time.
+          - step_id: transfer_to_agent_a
+            task_name: transfer_obligation
+            assignee_override: { kind: proposer }
+            inputs:
+              acting_as_group: $landlord_ctx.group_id
+              contract_id: "$step.mint_agency.composed_contract_id"
+              destination_id: $agent_a_ctx.user_id
+          # The landlord registers the send policy ON G, executor = the agency NFT.
+          # executor_accounts[0] = the agency COLLECTION (the deployed class);
+          # executor_ids[0] = the minted NFT's REAL token id — BOTH lifted from the
+          # mint by the bridge (the capture this suite proves). Registrar (landlord)
+          # == sole required signer ⇒ auto-approve, no approve step. amount_bounds
+          # RAW wei. The mandatory NFT-executor amount bound is satisfied.
+          - step_id: register_send_policy
+            task_name: add_data_policy
+            assignee_override: { kind: proposer }
+            inputs:
+              acting_as_group: $landlord_ctx.group_id
+              account_address: $landlord_ctx.group_account_address
+              policy_id: "$(cat /tmp/yf_agency_dms_nonce)1"
+              executor_accounts: [ "$step.mint_agency.obligation_address" ]
+              executor_ids:      [ "$step.mint_agency.token_id" ]
+              required_signers:  [ $landlord_self_ctx.default_wallet_id ]
+              min_signatories: 1
+              allowed_operations: [ send ]
+              amount_bounds:
+                - { token: aud-token-asset, lo: "0", hi: "500000000000000000000" }
+              requirements:
+                - { source: 0, denomination: aud-token-asset, lo: "0", hi: "1000000000000000000000000000" }
+              max_use: "10"
+              expiry: "$(date -u -d '+365 days' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+365d +%Y-%m-%dT%H:%M:%SZ)"
+          # Agent A — the holder — executes the send policy. The bridge mints a
+          # group delegation for A; the OFF-CHAIN gate must resolve ownerOf(agency,
+          # tokenId) == A's account to grant it (the NFT-aware is_valid_policy_member
+          # path). Send 100 AUD G→A (HUMAN amount; bridge scales).
+          - step_id: agent_a_executes
+            task_name: execute_under_policy
+            assignee_override: { kind: party, role: agent_a }
+            inputs:
+              account_address: $landlord_ctx.group_account_address
+              acting_as_group: $landlord_ctx.group_id
+              policy_id: "$step.register_send_policy.policy_id"
+              operation_type: Send
+              asset_id: aud-token-asset
+              amount: "100"
+              destination_id: $agent_a_ctx.user_id
+          # Agent A hands the credential to agent B (A owns it personally now — no
+          # group context). The execute-right will move WITH the NFT.
+          - step_id: transfer_a_to_b
+            task_name: transfer_obligation
+            assignee_override: { kind: party, role: agent_a }
+            inputs:
+              contract_id: "$step.mint_agency.composed_contract_id"
+              destination_id: $agent_b_ctx.user_id
+          # ★ TRANSFERABILITY PROOF: agent B is named in NO policy, yet now executes
+          #   G's send policy PURELY because it holds the agency NFT. ownerOf(agency,
+          #   tokenId) == B's account now. Send 100 AUD G→B.
+          - step_id: agent_b_executes
+            task_name: execute_under_policy
+            assignee_override: { kind: party, role: agent_b }
+            inputs:
+              account_address: $landlord_ctx.group_account_address
+              acting_as_group: $landlord_ctx.group_id
+              policy_id: "$step.register_send_policy.policy_id"
+              operation_type: Send
+              asset_id: aud-token-asset
+              amount: "100"
+              destination_id: $agent_b_ctx.user_id
+        edges:
+          - { from: mint_agency,          to: transfer_to_agent_a,  condition: { kind: on_success } }
+          - { from: transfer_to_agent_a,  to: register_send_policy, condition: { kind: on_success } }
+          - { from: register_send_policy, to: agent_a_executes,     condition: { kind: on_success } }
+          - { from: agent_a_executes,     to: transfer_a_to_b,      condition: { kind: on_success } }
+          - { from: transfer_a_to_b,      to: agent_b_executes,     condition: { kind: on_success } }
+
+  - name: assert_deal_proposed
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { actual: "$propose_agency.deal_id", contains: "DEAL" }
+
+  # ═══════════════ 2 — BOTH AGENTS SIGN → ACTIVATE ═══════════════
+  # The proposer (landlord) auto-signs at propose. Agent A + agent B each sign; the
+  # LAST signer flips Proposed → Active and starts the DAG.
+  - name: agent_a_sign
+    type: sign_deal
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { deal_id: $propose_agency.deal_id }
+  - name: agent_b_sign
+    type: sign_deal
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { deal_id: $propose_agency.deal_id }
+  - name: assert_deal_active
+    type: assert
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { actual: "$agent_b_sign.status", equals: "ACTIVE" }
+
+  # ═══════════════ 3 — DRIVE THE DAG STEPS (caveat A) ═══════════════
+  # Step 1: G mints the agency credential to itself.
+  - name: exec_mint_agency
+    type: execute_step
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { deal_id: $propose_agency.deal_id, step_id: mint_agency, find_timeout: 120 }
+  - name: await_mint
+    type: sleep
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { seconds: 15 }
+
+  # Step 2: G transfers the credential to agent A.
+  - name: exec_transfer_to_a
+    type: execute_step
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { deal_id: $propose_agency.deal_id, step_id: transfer_to_agent_a, find_timeout: 120 }
+  - name: await_transfer_a
+    type: sleep
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { seconds: 15 }
+
+  # Step 3: the landlord registers the NFT-executor send policy (auto-approves).
+  # Must settle + project before agent A's execute resolves ownerOf off-chain.
+  - name: exec_register_policy
+    type: execute_step
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { deal_id: $propose_agency.deal_id, step_id: register_send_policy, find_timeout: 120 }
+  # Settle wait: the AddDataPolicy POST-SETTLE hook must write the `data_policies` projection (incl.
+  # the non-zero executors_id NFT slot) before agent_a_executes' off-chain delegation mint reads it
+  # via is_valid_policy_member → valid_nft_executor_slots. (The deeper cause of the earlier hang was a
+  # BRIDGE bug — payment_bridge.rs dropped executor_ids from the addDataPolicy mutation, so the slot
+  # projected empty regardless of timing; fixed by adding the executorIds mapping. This wait only
+  # covers the legitimate projection latency now that the slot is actually written.)
+  - name: await_register
+    type: sleep
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { seconds: 20 }
+
+  # Snapshot G's confidential AUD BEFORE the two bounded releases (real movement proof).
+  - name: bal_g_before
+    type: balance
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { asset_id: aud-token-asset }
+
+  # Step 4: agent A (the holder) executes the policy → SUCCESS (off-chain ownerOf gate).
+  - name: exec_agent_a
+    type: execute_step
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { deal_id: $propose_agency.deal_id, step_id: agent_a_executes, find_timeout: 120 }
+  - name: await_a_exec
+    type: sleep
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { seconds: 20 }
+  # Agent A ACCEPTS the bounded send it just received (G→A 100). A confidential
+  # send only finalizes the SENDER's debit once the recipient accepts (same as
+  # doc_escrow_dms's beneficiary_accept) — without this, G's private_balance shows
+  # the send still in flight and the debit assert sees no change. wait:true settles it.
+  - name: agent_a_accept
+    type: accept_all
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { denomination: aud-token-asset, wait: true }
+
+  # Step 5: agent A hands the credential to agent B.
+  - name: exec_transfer_a_to_b
+    type: execute_step
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { deal_id: $propose_agency.deal_id, step_id: transfer_a_to_b, find_timeout: 120 }
+  - name: await_transfer_b
+    type: sleep
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters: { seconds: 15 }
+
+  # Step 6: agent B (the NEW holder) executes the policy → SUCCESS (the headline).
+  - name: exec_agent_b
+    type: execute_step
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { deal_id: $propose_agency.deal_id, step_id: agent_b_executes, find_timeout: 120 }
+  - name: await_b_exec
+    type: sleep
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { seconds: 20 }
+  # Agent B ACCEPTS the bounded send it just received (G→B 100) — finalizes the
+  # second debit to G (see agent_a_accept).
+  - name: agent_b_accept
+    type: accept_all
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { denomination: aud-token-asset, wait: true }
+  - name: await_settle
+    type: sleep
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { seconds: 15 }
+
+  # ═══════════════ 4 — FUND-MOVEMENT PROOF (not status-only) ═══════════════
+  # The two bounded sends (A then B) DEBIT G's confidential AUD; both recipients
+  # have now accepted (above), finalizing the debit. Directional (strictly decreased)
+  # — G fell by ~200 AUD across the two releases. TIGHTEN to exact 200 once a live
+  # run confirms the settled delta.
+  - name: bal_g_after
+    type: balance
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { asset_id: aud-token-asset }
+  - name: assert_g_debited
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { actual: "$bal_g_after.private_balance", lt: "$bal_g_before.private_balance" }
+
+  # ═══════════════ 5 — POST-DEAL NEGATIVES (direct; cannot be deal nodes) ═══════════════
+  # ★ NON-HOLDER DENY (off-chain). payer never held the agency NFT, is not a group
+  #   member, and is not an executor. Requesting a group delegation to execute forces
+  #   a FRESH delegation mint (no cached JWT): is_derived_policy_member →
+  #   ownerOf(collection, tokenId) != payer's account → false → 403 at the mint; the
+  #   harness falls back to payer's regular token and the resolver rejects it with
+  #   "acting as the group". DIRECT shape: nested operation_data, RAW wei (caveat B/C).
+  - name: nonholder_denied
+    type: execute_under_policy
+    user: { id: payer@yieldfabric.com, password: payer_password, group: Issuer Group }
+    parameters:
+      account_address: $landlord_ctx.group_account_address
+      policy_id: "$(cat /tmp/yf_agency_dms_nonce)1"
+      operation_type: Send
+      operation_data: { token_address: aud-token-asset, destination_id: payer@yieldfabric.com, amount: "100000000000000000000" }
+      idempotency_key: nftdms-nonholder-$(date +%s)
+      expect_failure: true
+      expect_error: "acting as the group"
+
+  # ★ FORMER-HOLDER DENY (revocation-by-transfer). collateral handed the NFT to
+  #   investor inside the deal, so it no longer holds it. A fresh delegation mint
+  #   resolves ownerOf == investor != collateral → off-chain deny "acting as the
+  #   group". (Caveat D: if a stale delegation is granted, it surfaces on-chain as
+  #   "NotAuthorizedPolicyCaller" instead — widen the expect_error then.) The right
+  #   MOVED to B; it did not duplicate to the former holder.
+  - name: former_holder_denied
+    type: execute_under_policy
+    user: { id: collateral@yieldfabric.com, password: collateral_password, group: Issuer Group }
+    parameters:
+      account_address: $landlord_ctx.group_account_address
+      policy_id: "$(cat /tmp/yf_agency_dms_nonce)1"
+      operation_type: Send
+      operation_data: { token_address: aud-token-asset, destination_id: collateral@yieldfabric.com, amount: "100000000000000000000" }
+      idempotency_key: nftdms-former-$(date +%s)
+      expect_failure: true
+      expect_error: "acting as the group"

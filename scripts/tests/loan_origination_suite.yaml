@@ -1,0 +1,174 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  LOAN ORIGINATION — fund a loan account, swap a BARE agreement for the principal
+# ════════════════════════════════════════════════════════════════════════════
+#
+#  The explicit-command counterpart to the `loan` deal TEMPLATE
+#  (yieldfabric-dms/templates/loan/plan.json). Proves the origination mechanic
+#  the template encodes, the way loan_auto_collect_transfer_suite proves the
+#  transferable-note model — via the harness verbs, not the deal flow.
+#
+#  MODEL:
+#    loan account = the LENDER's group account (here "Issuer Group", owned by the
+#                   issuer). Funded with the principal; the principal is disbursed
+#                   to the borrower via the origination swap; the borrower repays
+#                   into it each period.
+#    lender   = issuer (owns the loan account; funds it; initiates the swap AS the
+#               account — acting_as_group — so the principal is paid FROM the account).
+#    borrower = payer (mints the BARE loan agreement; receives the principal; repays).
+#
+#  THE 5 STEPS (the user's spec):
+#    1) lender creates a loan account        → use the issuer's "Issuer Group"
+#    2) lender funds the loan account        → deposit + instant + accept
+#    3) borrower mints loan agreement         → create_obligation, counterpart=borrower,
+#       (counterpart=borrower, NO payments)     no initial payments ⇒ bare, auto-accepts
+#    4) borrower swaps loan for the initial   → create_swap: the BORROWER (initiator)
+#       loan payment FROM the loan account      commits the agreement; the loan account
+#                                               (counterparty, completing AS the group)
+#                                               PAYS the principal ⇒ principal→borrower,
+#                                               agreement→loan account
+#    5) borrower makes periodic payments      → instant borrower → loan account (one shown)
+#
+#  WITHOUT locked-in payments: the agreement carries NO payment legs — the repayments
+#  are the separate `instant` sends, NOT coupons locked into the obligation.
+#
+#  ⚠️ The lender (issuer) must own the loan-account group + hold the perms to act AS
+#     it (SuperAdmin in the demo). Fresh deploy + setup.yaml (issuer/payer seeded).
+#  Run: PYTHONPATH=. python -m yieldfabric.cli execute ../scripts/tests/loan_origination_suite.yaml
+# ════════════════════════════════════════════════════════════════════════════
+
+commands:
+
+  # ───────────────────────── IDENTITY ─────────────────────────
+  - name: lender_ctx          # issuer acting AS the loan account (Issuer Group)
+    type: whoami
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+  - name: borrower_ctx        # payer = the borrower (mints the agreement, gets the principal)
+    type: whoami
+    user: { id: payer@yieldfabric.com, password: payer_password }
+
+  # ───────── 2 — LENDER FUNDS THE LOAN ACCOUNT (principal in, made spendable) ─────────
+  - name: lender_deposit      # issuer pulls public → private so it has principal to fund with
+    type: deposit
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { asset_id: aud-token-asset, amount: 1000000000000000000000, idempotency_key: lo-fund-$(date +%s | tee /tmp/yf_lo_nonce) }
+  - name: fund_loan_account   # issuer → the loan account (Issuer Group)
+    type: instant
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { asset_id: aud-token-asset, amount: 1000000000000000000000, destination_id: Issuer Group, idempotency_key: lo-payin-$(cat /tmp/yf_lo_nonce) }
+  - name: loan_account_accept # the loan account accepts the funding ⇒ spendable for the swap
+    type: accept_all
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { denomination: aud-token-asset, wait: true }
+
+  # ───────── 3 — BORROWER MINTS THE BARE LOAN AGREEMENT ─────────
+  # counterpart=borrower + no payments ⇒ self-counterpart auto-accept; the borrower
+  # HOLDS it (ready to commit to the swap). `contract_id` is a suite-local alias the
+  # swap references. NO obligation_address ⇒ chain-default (swappable) class.
+  - name: mint_loan_agreement
+    type: create_obligation
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      counterpart: payer@yieldfabric.com
+      contract_id: loan_agreement
+      expiry: $(date -u -d '+365 days' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+365d +%Y-%m-%dT%H:%M:%SZ)
+      data: { name: "Loan Agreement", description: "Bare IOU: no locked-in payments; repayments are the separate periodic sends" }
+      idempotency_key: lo-mint-$(cat /tmp/yf_lo_nonce)
+
+  # ───────── snapshot BEFORE the disbursement ─────────
+  - name: loan_account_before
+    type: balance
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { asset_id: aud-token-asset }
+  - name: borrower_before
+    type: balance
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { asset_id: aud-token-asset }
+
+  # ───────── 4 — DISBURSE: borrower commits the agreement, loan account PAYS the principal ─────────
+  # The BORROWER is the initiator and commits the bare agreement; the loan account is
+  # the counterparty whose `expected_payments` is the principal. The loan account
+  # COMPLETES the swap acting AS the group (`group:` field), paying the principal FROM
+  # the account. Settles: principal → borrower (initiator), agreement → loan account.
+  # (Proven shape: obligation-side initiates, payment-side — a group — completes, as in
+  # swap_lifecycle_combinations_group_suite's repo legs.)
+  - name: disburse_create
+    type: create_swap
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      swap_id: "990001"
+      idempotency_key: lo-disburse-create-$(cat /tmp/yf_lo_nonce)
+      deadline: $(date -u -d '+40 days' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+40d +%Y-%m-%dT%H:%M:%SZ)
+      initiator:
+        obligation_ids: [loan_agreement]
+      counterparty:
+        id: Issuer Group
+        expected_payments: { denomination: aud-token-asset, amount: 1000000000000000000000, payments: [{ id: lo-principal-1 }] }
+  - name: disburse_complete   # the loan account (counterparty, AS the group) pays + settles
+    type: complete_swap
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { swap_id: "990001", idempotency_key: lo-disburse-complete-$(cat /tmp/yf_lo_nonce) }
+
+  # ───────── borrower ACCEPTS the principal (delivered confidential ⇒ locked_in) ─────────
+  - name: borrower_accept
+    type: accept_all
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { denomination: aud-token-asset, wait: true }
+  - name: settle_disburse
+    type: sleep
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { seconds: 20 }
+  - name: borrower_after
+    type: balance
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { asset_id: aud-token-asset }
+  - name: loan_account_after
+    type: balance
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { asset_id: aud-token-asset }
+
+  # ───────── ASSERTS: exact conservation of the disbursement ─────────
+  - name: assert_borrower_received
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      # the borrower's spendable rose by EXACTLY the principal — the swap delivered it.
+      actual: "$borrower_after.private_balance"
+      minus: "$borrower_before.private_balance"
+      equals: "1000000000000000000000"
+  - name: assert_loan_account_debited
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      # the loan account fell by EXACTLY the principal — it PAID from the account
+      # (acting_as_group), not the lender's wallet. Conservation: out == in.
+      actual: "$loan_account_before.private_balance"
+      minus: "$loan_account_after.private_balance"
+      equals: "1000000000000000000000"
+
+  # ───────── 5 — PERIODIC REPAYMENT (one shown; the rest follow the same shape) ─────────
+  # The borrower repays INTO the loan account — a separate send, NOT a locked-in
+  # coupon on the agreement. The loan account accepts it; the lender is repaid.
+  - name: repay
+    type: instant
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { asset_id: aud-token-asset, amount: 100000000000000000000, destination_id: Issuer Group, idempotency_key: lo-repay-1-$(cat /tmp/yf_lo_nonce) }
+  - name: loan_account_accept_repay
+    type: accept_all
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { denomination: aud-token-asset, wait: true }
+  - name: settle_repay
+    type: sleep
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { seconds: 20 }
+  - name: loan_account_repaid
+    type: balance
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { asset_id: aud-token-asset }
+  - name: assert_repayment_received
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      # the loan account rose by EXACTLY one repayment (it was 0 after disbursing).
+      actual: "$loan_account_repaid.private_balance"
+      minus: "$loan_account_after.private_balance"
+      equals: "100000000000000000000"

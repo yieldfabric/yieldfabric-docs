@@ -7,10 +7,11 @@ from typing import List, Optional
 
 from ..config import YieldFabricConfig
 from ..models import Command, CommandResponse
-from ..services import AuthService, PaymentsService
+from ..services import AgentsService, AuthService, PaymentsService
 from ..executors import (
     AssertExecutor,
     ComposedExecutor,
+    DealExecutor,
     GroupAdminExecutor,
     ObligationExecutor,
     PaymentExecutor,
@@ -45,6 +46,7 @@ class YieldFabricRunner:
         # Initialize services
         self.auth_service = AuthService(self.config)
         self.payments_service = PaymentsService(self.config)
+        self.agents_service = AgentsService(self.config)
         self.token_manager = TokenManager(self.auth_service, self.config)
         
         # Initialize core components
@@ -100,12 +102,19 @@ class YieldFabricRunner:
             self.auth_service, self.payments_service,
             self.output_store, self.config, self.token_manager
         )
+        # Deal-lifecycle executor — constructs its own AgentsService
+        # (config.agents_service_url) for the dealFlow GraphQL on :3001.
+        self.deal_executor = DealExecutor(
+            self.auth_service, self.payments_service,
+            self.output_store, self.config, self.token_manager
+        )
 
         # Initialize validators
         self.yaml_validator = YAMLValidator(debug=self.config.debug)
         self.service_validator = ServiceValidator(
             self.auth_service, self.payments_service,
-            debug=self.config.debug
+            debug=self.config.debug,
+            agents_service=self.agents_service,
         )
     
     def execute_file(self, yaml_file: str) -> bool:
@@ -155,6 +164,18 @@ class YieldFabricRunner:
             # Substitute variables in parameters
             substituted_params = self.output_store.substitute_params(command.parameters.to_dict())
             command.parameters = type(command.parameters).from_dict(substituted_params)
+
+            # Substitute the user fields too, so a command can act as a
+            # DYNAMIC group (e.g. `group: "Property Account $(cat …nonce)"` or a
+            # `$cmd.field` ref). Literals (a plain email/password) contain no
+            # `$`/`$(…)` and pass through unchanged, so this is a no-op for the
+            # common case and only matters for delegation-by-dynamic-group.
+            if command.user.id:
+                command.user.id = self.output_store.substitute(command.user.id)
+            if command.user.password:
+                command.user.password = self.output_store.substitute(command.user.password)
+            if command.user.group:
+                command.user.group = self.output_store.substitute(command.user.group)
 
             # Execute command
             response = self.execute_command(command)
@@ -283,6 +304,18 @@ class YieldFabricRunner:
             return self.composed_executor.execute(command)
 
         elif command_type in [
+            # Deal lifecycle + auto-pay (the dealFlow GraphQL on agents :3001).
+            "propose_deal", "sign_deal",
+            "set_automation_key", "revoke_automation_key",
+            "set_loan_collect_key", "revoke_loan_collect_key",
+            "deal_automation_status", "deal_periods",
+            # Drive a deferred on-chain step's /execute as its assignee
+            # (one-time setup steps; recurring payments are scheduler-driven).
+            "execute_step",
+        ]:
+            return self.deal_executor.execute(command)
+
+        elif command_type in [
             "whoami",
             "add_data_policy",
             "approve_data_policy",
@@ -365,6 +398,8 @@ class YieldFabricRunner:
         """Close service connections."""
         self.auth_service.close()
         self.payments_service.close()
+        self.agents_service.close()
+        self.deal_executor.agents_service.close()
     
     def __enter__(self):
         """Context manager entry."""

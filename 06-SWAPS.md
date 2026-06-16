@@ -290,6 +290,8 @@ mutation {
 
 **Note:** The `completeSwap` mutation automatically retrieves expected payment details from the stored swap record, so you only need to provide the `swapId`. Counterparty collateral can be provided if required for repo swaps.
 
+**Completing as a group account.** The counterparty can be a **group / shared account** rather than a personal wallet — it funds its `counterpartyExpectedPayments` from the group's own balance. The caller presents a **group-delegation JWT** so the bearer acts AS the group (which must be the swap's `counterparty`). In a DMS deal this is driven by the `acting_as_group` input on the `complete_swap` step (the bridge strips it and mints the delegation JWT before calling `completeSwap` — it is not a GraphQL input field). Since an expected payment is funded by whoever *completes* the swap, the payer must sit on the **counterparty/complete** side to debit value FROM a group account. This is the **loan-origination** pattern: the borrower initiates a swap offering a bare loan-agreement obligation, and the lender's funded **loan account** completes-and-pays the principal.
+
 ---
 
 ### 3. Cancel Swap

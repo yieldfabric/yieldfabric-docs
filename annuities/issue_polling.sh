@@ -4,7 +4,7 @@
 # Usage:
 #   ./issue_polling.sh WORKFLOW_ID
 #
-# Optionally uses PAY_SERVICE_URL from environment; defaults to https://pay.yieldfabric.com
+# Optionally uses PAY_SERVICE_URL from environment; defaults to https://pay.test.yieldfabric.com
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
@@ -18,7 +18,7 @@ for env_file in "${REPO_ROOT}/.env" "${REPO_ROOT}/.env.local" "${SCRIPT_DIR}/.en
     fi
 done
 
-PAY_SERVICE_URL="${PAY_SERVICE_URL:-https://pay.yieldfabric.com}"
+PAY_SERVICE_URL="${PAY_SERVICE_URL:-https://pay.test.yieldfabric.com}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

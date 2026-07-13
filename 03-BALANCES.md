@@ -9,19 +9,19 @@ Complete guide to querying account balances and understanding locked transaction
 Get balance for a specific denomination and obligor:
 
 ```bash
-curl -X GET "https://pay.yieldfabric.com/balance?denomination=aud-token-asset&obligor=null" \
+curl -X GET "https://pay.test.yieldfabric.com/balance?denomination=aud-token-asset&obligor=null" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
 **With specific obligor:**
 ```bash
-curl -X GET "https://pay.yieldfabric.com/balance?denomination=aud-token-asset&obligor=issuer@yieldfabric.com" \
+curl -X GET "https://pay.test.yieldfabric.com/balance?denomination=aud-token-asset&obligor=issuer@yieldfabric.com" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
 **With group ID (for group/delegation queries):**
 ```bash
-curl -X GET "https://pay.yieldfabric.com/balance?denomination=aud-token-asset&obligor=null&group_id=550e8400-e29b-41d4-a716-446655440000" \
+curl -X GET "https://pay.test.yieldfabric.com/balance?denomination=aud-token-asset&obligor=null&group_id=550e8400-e29b-41d4-a716-446655440000" \
   -H "Authorization: Bearer $TOKEN"
 ```
 

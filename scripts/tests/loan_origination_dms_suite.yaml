@@ -10,10 +10,12 @@
 #  the template change actually touches.
 #
 #  The template (yieldfabric-dms/templates/loan/plan.json) is loaded VERBATIM via
-#  propose_deal's `plan_file` (no inline copy → no drift). Its 5 nodes:
-#    create_loan_account (lender) · fund_loan_account (lender) · mint_loan_agreement
-#    (borrower) · disburse_swap (borrower, offers the agreement) · complete_disburse_swap
-#    (lender, AS the loan account, funds the principal)   — then a periodic repay phase.
+#  propose_deal's `plan_file` (no inline copy → no drift). Its 6 nodes:
+#    create_loan_account (lender) · fund_loan_account (lender) · accept_principal
+#    (lender, AS the loan account — redeems the funding into spendable balance) ·
+#    mint_loan_agreement (borrower) · disburse_swap (borrower, offers the agreement) ·
+#    complete_disburse_swap (lender, AS the loan account, funds the principal)
+#    — then a periodic repay phase.
 #
 #  Roles: lender = issuer (proposer; owns the loan-account group + the perms to act
 #  AS it — SuperAdmin in the demo). borrower = payer (counterparty, role "borrower").
@@ -78,8 +80,22 @@ commands:
     type: execute_step
     user: { id: issuer@yieldfabric.com, password: issuer_password }
     parameters: { deal_id: "$propose.deal_id", step_id: fund_loan_account, find_timeout: 120 }
-  # No accept step: instant_send auto-completes to the loan account's spendable balance,
-  # so the account can fund the swap at completion without an intervening accept leg.
+  # fund_loan_account is a confidential instant_send — it lands locked_in (PROCESSING),
+  # NOT spendable. Let the payment settle, then the loan account (lender acting_as_group)
+  # ACCEPTS it so the principal is spendable before complete_disburse_swap draws on it.
+  # Without this, complete reverts with "Insufficient balance. Available: 0".
+  - name: settle_fund
+    type: sleep
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { seconds: 25 }
+  - name: exec_accept
+    type: execute_step          # the LENDER accepts the funding AS the loan account
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { deal_id: "$propose.deal_id", step_id: accept_principal, find_timeout: 120 }
+  - name: settle_accept
+    type: sleep
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { seconds: 25 }
   - name: exec_mint
     type: execute_step          # the BORROWER mints the bare agreement
     user: { id: payer@yieldfabric.com, password: payer_password }

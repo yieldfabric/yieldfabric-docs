@@ -235,7 +235,7 @@ class TokenManager:
         return remaining <= margin
 
     def _chain_id_for_token(self, token: str) -> str:
-        claim = extract_claim(token, "chain_id", "chainId")
+        claim = extract_claim(token, "default_chain_id", "chain_id", "chainId")
         if claim:
             return str(claim)
         return os.getenv("CHAIN_ID", self._DEFAULT_CHAIN_ID)

@@ -5,8 +5,8 @@
 ## Base URLs
 
 - **Auth Service**: `https://auth.yieldfabric.com`
-- **Payments/GraphQL Service**: `https://pay.yieldfabric.com`
-- **GraphQL Endpoint**: `https://pay.yieldfabric.com/graphql`
+- **Payments/GraphQL Service**: `https://pay.test.yieldfabric.com`
+- **GraphQL Endpoint**: `https://pay.test.yieldfabric.com/graphql`
 
 ---
 
@@ -168,19 +168,19 @@ curl -X DELETE https://auth.yieldfabric.com/auth/delegation/tokens/{token_id} \
 Get balance for a specific denomination and obligor:
 
 ```bash
-curl -X GET "https://pay.yieldfabric.com/balance?denomination=aud-token-asset&obligor=null" \
+curl -X GET "https://pay.test.yieldfabric.com/balance?denomination=aud-token-asset&obligor=null" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
 **With specific obligor:**
 ```bash
-curl -X GET "https://pay.yieldfabric.com/balance?denomination=aud-token-asset&obligor=issuer@yieldfabric.com" \
+curl -X GET "https://pay.test.yieldfabric.com/balance?denomination=aud-token-asset&obligor=issuer@yieldfabric.com" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
 **With group ID (for group/delegation queries):**
 ```bash
-curl -X GET "https://pay.yieldfabric.com/balance?denomination=aud-token-asset&obligor=null&group_id=550e8400-e29b-41d4-a716-446655440000" \
+curl -X GET "https://pay.test.yieldfabric.com/balance?denomination=aud-token-asset&obligor=null&group_id=550e8400-e29b-41d4-a716-446655440000" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -344,7 +344,7 @@ Each transaction in `locked_out` and `locked_in` contains:
 Get contracts for a specific entity:
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -544,7 +544,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 Fetch all payments for an entity:
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -754,7 +754,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 Create a new contract/obligation:
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -802,7 +802,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 **Using GraphQL query with variables** (recommended):
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -819,7 +819,7 @@ Then filter by ID in your application, or use the full contracts list above.
 Send an instant payment to another entity:
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -829,7 +829,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 
 **Alternative with destination wallet ID:**
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -869,7 +869,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 Accept a pending payment:
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -905,7 +905,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 Get all swaps for a specific entity:
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1064,7 +1064,7 @@ This example shows a completed swap where:
 Create a swap to exchange obligations for payment:
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1115,7 +1115,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 Complete a swap by providing the required payment:
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1155,7 +1155,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 Send tokens to multiple recipients in a single operation using Merkle trees:
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1184,7 +1184,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 Deposit tokens into your intelligent account:
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1199,7 +1199,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 Withdraw tokens from your intelligent account:
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1214,7 +1214,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 Accept all pending payables for a given denomination in a single call:
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1233,7 +1233,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 Repurchase collateral from a repo swap before expiry:
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1248,7 +1248,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 **Step 1: Initiate Roll** — Creates a new swap in Pending state:
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1267,7 +1267,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 **Step 2: Complete Roll** — Counterparty pays upfront, old repo repurchased, collateral migrated:
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $COUNTERPARTY_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1286,7 +1286,7 @@ This example demonstrates how to create and settle an annuity using self-referen
 Issuer creates obligation with **themselves as both obligor AND counterpart** to build structure without counterparty risk:
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1310,7 +1310,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 **Step 2: Accept the annuity stream obligation**
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1321,7 +1321,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 **Step 3: Create redemption obligation (100 AUD)**
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1341,7 +1341,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 **Step 4: Accept the redemption obligation**
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1352,7 +1352,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 **Step 5: Create atomic swap (exchange obligations for upfront payment)**
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1372,7 +1372,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 **Step 6: Counterpart completes the swap (pays 100 AUD upfront)**
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $COUNTERPART_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{

@@ -43,7 +43,7 @@ echo "Token: ${TOKEN:0:50}..."
 Before you can send payments, deposit tokens into your intelligent account:
 
 ```bash
-curl -s -X POST https://pay.yieldfabric.com/graphql \
+curl -s -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -56,7 +56,7 @@ curl -s -X POST https://pay.yieldfabric.com/graphql \
 ## Step 3: Check Your Balance
 
 ```bash
-curl -s -X GET "https://pay.yieldfabric.com/balance?denomination=aud-token-asset&obligor=null" \
+curl -s -X GET "https://pay.test.yieldfabric.com/balance?denomination=aud-token-asset&obligor=null" \
   -H "Authorization: Bearer $TOKEN" | jq
 ```
 
@@ -72,7 +72,7 @@ curl -s -X GET "https://pay.yieldfabric.com/balance?denomination=aud-token-asset
 ## Step 4: Send an Instant Payment
 
 ```bash
-curl -s -X POST https://pay.yieldfabric.com/graphql \
+curl -s -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -94,14 +94,14 @@ curl -s -X POST https://pay.yieldfabric.com/graphql \
 First, check your balance to see incoming payments:
 
 ```bash
-curl -s -X GET "https://pay.yieldfabric.com/balance?denomination=aud-token-asset&obligor=null" \
+curl -s -X GET "https://pay.test.yieldfabric.com/balance?denomination=aud-token-asset&obligor=null" \
   -H "Authorization: Bearer $RECIPIENT_TOKEN" | jq '.locked_in'
 ```
 
 Then accept using the `id_hash` from locked_in:
 
 ```bash
-curl -s -X POST https://pay.yieldfabric.com/graphql \
+curl -s -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $RECIPIENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -114,7 +114,7 @@ curl -s -X POST https://pay.yieldfabric.com/graphql \
 ## Step 6: Check Balance Again
 
 ```bash
-curl -s -X GET "https://pay.yieldfabric.com/balance?denomination=aud-token-asset&obligor=null" \
+curl -s -X GET "https://pay.test.yieldfabric.com/balance?denomination=aud-token-asset&obligor=null" \
   -H "Authorization: Bearer $TOKEN" | jq
 ```
 
@@ -138,7 +138,7 @@ curl -s -X GET "https://pay.yieldfabric.com/balance?denomination=aud-token-asset
 
 **Create a Payment Obligation:**
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -148,7 +148,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 
 **Create a Distribution (One-to-Many Payment):**
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -169,7 +169,7 @@ export DELEGATION_TOKEN=$(curl -s -X POST https://auth.yieldfabric.com/auth/dele
   }' | jq -r '.delegation_jwt')
 
 # Use delegation token for group operations
-curl -X GET "https://pay.yieldfabric.com/balance?denomination=aud-token-asset&obligor=null" \
+curl -X GET "https://pay.test.yieldfabric.com/balance?denomination=aud-token-asset&obligor=null" \
   -H "Authorization: Bearer $DELEGATION_TOKEN" | jq
 ```
 

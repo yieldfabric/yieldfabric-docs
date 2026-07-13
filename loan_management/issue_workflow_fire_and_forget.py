@@ -347,7 +347,7 @@ def main():
         print("Environment variables (used as fallback if arguments not provided):")
         print("  USER_EMAIL         User email for authentication")
         print("  PASSWORD           User password for authentication")
-        print("  PAY_SERVICE_URL    Payments service URL (default: https://pay.yieldfabric.com)")
+        print("  PAY_SERVICE_URL    Payments service URL (default: https://pay.test.yieldfabric.com)")
         print("  AUTH_SERVICE_URL   Auth service URL (default: https://auth.yieldfabric.com)")
         print("  DENOMINATION      Token denomination (default: aud-token-asset)")
         print("  COUNTERPART       Counterparty email (default: issuer@yieldfabric.com)")
@@ -435,7 +435,7 @@ def main():
         return 1
     
     # Configuration
-    pay_service_url = os.environ.get('PAY_SERVICE_URL', 'https://pay.yieldfabric.com')
+    pay_service_url = os.environ.get('PAY_SERVICE_URL', 'https://pay.test.yieldfabric.com')
     auth_service_url = os.environ.get('AUTH_SERVICE_URL', 'https://auth.yieldfabric.com')
     denomination = os.environ.get('DENOMINATION', 'aud-token-asset')
     counterpart = os.environ.get('COUNTERPART', 'issuer@yieldfabric.com')

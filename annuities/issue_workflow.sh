@@ -18,7 +18,7 @@ for env_file in "${REPO_ROOT}/.env" "${REPO_ROOT}/.env.local" "${SCRIPT_DIR}/.en
 done
 
 # Configuration
-PAY_SERVICE_URL="${PAY_SERVICE_URL:-https://pay.yieldfabric.com}"
+PAY_SERVICE_URL="${PAY_SERVICE_URL:-https://pay.test.yieldfabric.com}"
 AUTH_SERVICE_URL="${AUTH_SERVICE_URL:-https://auth.yieldfabric.com}"
 
 # Colors for output (matching executor scripts)

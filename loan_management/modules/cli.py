@@ -31,7 +31,7 @@ def print_usage() -> None:
     print("Environment variables (used as fallback if arguments not provided):")
     print("  ISSUER_EMAIL        Issuer email for authentication (alias: USER_EMAIL)")
     print("  ISSUER_PASSWORD     Issuer password for authentication (alias: PASSWORD)")
-    print("  PAY_SERVICE_URL     Payments service URL (default: https://pay.yieldfabric.com)")
+    print("  PAY_SERVICE_URL     Payments service URL (default: https://pay.test.yieldfabric.com)")
     print("  AUTH_SERVICE_URL    Auth service URL (default: https://auth.yieldfabric.com)")
     print("  DENOMINATION        Token denomination (default: aud-token-asset)")
     print("  COUNTERPART         Obligation counterparty email (default: issuer@yieldfabric.com)")

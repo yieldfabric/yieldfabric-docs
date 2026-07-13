@@ -600,10 +600,13 @@ follow-up Q&A.
 
 ## Usage metering
 
-Every upstream LLM call — chat, agent replies, embeddings, KG
-extraction — emits a usage event with the caller's entity id (from
-the JWT), the feature label, model, prompt/completion token counts,
-latency, and success/error. Two read endpoints:
+Every upstream LLM call — chat, agent replies, embeddings, multimodal
+document vision, KG extraction — goes through the agents provider and
+emits a usage event with the caller's entity id (from the JWT), feature,
+model, prompt/cached-prompt/completion token counts, latency, and
+success/error. The usage queue cannot drop events merely because a
+burst fills a bounded channel, and DB failures remain queued for
+redrive. Two read endpoints:
 
 ```bash
 # Daily rollups (llm_usage_daily)
@@ -642,8 +645,13 @@ was actually sent and received*. **Streaming chat completions are
 now audited too** — previously only non-streaming
 `complete` / structured / tool calls produced a transcript, so a
 streamed answer (every default chat reply) showed "no log for this
-call"; the streaming path now records the accumulated output at
-stream end, in parity with the buffered methods. **Embeddings are
+call"; the streaming lifecycle now records at normal EOF, upstream
+error, client disconnect, and even cancellation while waiting for
+upstream headers. After a downstream disconnect it continues draining
+the provider stream long enough to capture the final usage counters;
+when an upstream failure prevents a trailer, the failure row uses a
+marked token estimate rather than silently recording zero usage.
+**Embeddings are
 intentionally logless** — they meter (token counts, latency) but
 carry no prompt/output transcript, so the audit endpoint returns
 404 for an embedding event by design, not as an error.

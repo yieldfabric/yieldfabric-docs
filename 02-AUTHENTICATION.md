@@ -83,7 +83,7 @@ curl -X POST https://auth.yieldfabric.com/auth/groups/{group_id}/delegation-toke
 **For Group Operations:**
 ```bash
 # Use delegation token for group crypto operations
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $DELEGATION_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -94,14 +94,14 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 **For Group Balance Queries:**
 ```bash
 # Query group balance using delegation token
-curl -X GET "https://pay.yieldfabric.com/balance?denomination=aud-token-asset&obligor=null" \
+curl -X GET "https://pay.test.yieldfabric.com/balance?denomination=aud-token-asset&obligor=null" \
   -H "Authorization: Bearer $DELEGATION_TOKEN"
 ```
 
 **For Group Contract Operations:**
 ```bash
 # Create obligations on behalf of group
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $DELEGATION_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{

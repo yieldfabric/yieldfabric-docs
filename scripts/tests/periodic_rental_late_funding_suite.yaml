@@ -1,0 +1,392 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  PERIODIC RENTAL — LATE-FUNDING AUTO-SETTLE (the reaper regression proof)
+# ════════════════════════════════════════════════════════════════════════════
+#
+#  Forked from `periodic_rental_suite.yaml`. Same periodic-rental lifecycle, but
+#  it deliberately UNDERFUNDS the tenant before period 0's due date, lets the
+#  unattended `deal_period_scheduler` fire the rent step (which reverts on-chain
+#  with "Insufficient balance"), then FUNDS LATE and asserts the period
+#  AUTO-SETTLES on the next backoff window — with the property account credited
+#  EXACTLY ONE rent (no double-pay).
+#
+#  WHY THIS SUITE EXISTS (the defect it guards):
+#    A deferred periodic payment that reverts for insufficient funds emits a
+#    `WorkflowEvent::StepFailed`, NOT `WorkflowFailed` (the deliberate split that
+#    powers the user-facing /execute self-heal). The deal-events mirror only
+#    flips a PERIOD terminal on `WorkflowCompleted` / `WorkflowFailed`, so a
+#    StepFailed used to leave the period stuck at PROCESSING with workflow_id
+#    set — matched by NONE of the scheduler's three sweeps (reclaim needs
+#    workflow_id NULL; reschedule needs FAILED; due-scan needs SCHEDULED). The
+#    documented late-funding auto-settle therefore NEVER fired: the period sat
+#    PROCESSING forever and a late top-up did nothing.
+#
+#    The fix adds a per-tick PROCESSING reaper (`deal_period_scheduler.rs`:
+#    `reap_failed_processing_periods`) that polls the dispatched step's MQ
+#    message for its authoritative on-chain outcome and drives the period to
+#    FAILED (funding revert → fed to the EXISTING `reschedule_retryable_failed_async`
+#    backoff sweep → SCHEDULED → re-fired once funded), while a HARD revert goes
+#    terminal (FAILED-at-cap, NOT gas-looped) and a still-Pending settle is left
+#    PROCESSING (double-pay safe).
+#
+#  THE REGRESSION PROOF:
+#    • Step `period_0_failed_after_revert` polls dealPeriods until period 0 is
+#      FAILED. PRE-FIX this TIMES OUT at PROCESSING (the period never leaves it),
+#      so the suite fails right here — the suite IS the regression proof.
+#    • Step `period_0_auto_settled` then polls until period 0 is COMPLETED with
+#      NO manual `retryDealPeriod` — pure auto-settle off the backoff sweep.
+#    • The property account is credited EXACTLY one rent (delta + absolute).
+#
+#  ──────────────────────────────────────────────────────────────────────────
+#  ⚠️  TIMING MODEL (load-bearing — identical to periodic_rental_suite.yaml):
+#    The scheduler scans `deal_periods WHERE due_at <= NOW()` on the WALL CLOCK.
+#    `start_at` is 7 days ago so period 0 is already due. Two scheduler-driven
+#    waits dominate the runtime:
+#      (a) the FIRST fire → revert → reaper → FAILED. The reaper's candidate ttl
+#          is REAP_PROCESSING_TTL_SECS = 180s (a period must sit PROCESSING that
+#          long before it's reaped, so the reaper never races a still-settling
+#          period). So FAILED appears ~ (fire latency) + 180s + one tick.
+#      (b) FAILED → reschedule backoff (base 120s) → SCHEDULED → re-fire →
+#          settle → COMPLETED. So COMPLETED appears ~ 120s + (fire+settle).
+#    Both polls below use generous timeouts (900s) to absorb this end to end.
+#
+#  PARTIES (seeded SuperAdmins; see setup.yaml):
+#    originator@yieldfabric.com — LANDLORD (proposer; owns the property account)
+#    payer@yieldfabric.com      — TENANT  (pays rent; arms + owns the auto-pay key)
+#
+#  AMOUNTS: rent 1000 AUD/period. Tenant is UNDERFUNDED first (500 AUD < 1 rent),
+#  then topped up by 1000 AUD so it can cover exactly one period.
+#
+#  RUN (from yieldfabric-docs/python):
+#    PYTHONPATH=. python -m yieldfabric.cli execute \
+#      ../scripts/tests/periodic_rental_late_funding_suite.yaml
+# ════════════════════════════════════════════════════════════════════════════
+
+commands:
+
+  # ───────────────────────── IDENTITY ─────────────────────────
+  - name: landlord_ctx
+    type: whoami
+    user: { id: originator@yieldfabric.com, password: originator_password }
+
+  - name: tenant_ctx
+    type: whoami
+    user: { id: payer@yieldfabric.com, password: payer_password }
+
+  # ───────────────────────── UNDERFUND ─────────────────────────
+  # Fund the tenant with LESS than one rent (500 AUD < 1000 AUD). Period 0's
+  # rent step will revert on-chain with "Insufficient balance" — the funding
+  # failure this suite exercises. (A non-zero deposit, not zero, so the tenant
+  # has a real confidential balance the delta assert at the end can measure.)
+  - name: underfund_tenant
+    type: deposit
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      asset_id: aud-token-asset
+      amount: 500000000000000000000
+      idempotency_key: late-funding-underfund-$(date +%s | tee /tmp/yf_late_funding_nonce)
+
+  # ═══════════════ 1 — LANDLORD PROPOSES THE RENTAL DEAL ═══════════════
+  # Identical plan shape to periodic_rental_suite: a create_property setup node +
+  # a periodic_template paying fixed 1000 rent to the property account each
+  # period. start_at 7d ago ⇒ period 0 is immediately due.
+  - name: propose_rental
+    type: propose_deal
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      name: "9 Late St — Periodic Lease (late-funding)"
+      parties:
+        - { entity_id: $tenant_ctx.user_id, role: tenant }
+      idempotency_key: late-funding-propose-$(cat /tmp/yf_late_funding_nonce)
+      plan:
+        entry_step_ids: [create_property]
+        cashflow_ref: null
+        agreement_metadata:
+          governing_law: "New South Wales"
+          jurisdiction: "Sydney, Australia"
+          platform_terms_version: "1.0.0"
+        nodes:
+          - step_id: create_property
+            task_name: create_group_account
+            inputs:
+              name: "9 Late St — Property Account $(cat /tmp/yf_late_funding_nonce)"
+              group_type: "custom"
+              description: "Property account that collects rent each period."
+            assignee_override: { kind: proposer }
+        edges: []
+        periodic_template:
+          schedule:
+            kind: interval
+            start_at: "$(date -u -v-7d +%Y-%m-%dT%H:%M:%SZ)"
+            interval_days: 30
+            count: 12
+          per_period_entry_step_ids: [pay_rent]
+          per_period_actions:
+            - step_id: pay_rent
+              task_name: instant_send
+              inputs:
+                asset_id: aud-token-asset
+                amount: "1000"
+                destination_wallet_id: "$step.create_property.group_wallet_id"
+              assignee_override: { kind: party, role: tenant }
+          per_period_edges: []
+
+  - name: assert_deal_proposed
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      actual: "$propose_rental.deal_id"
+      contains: "DEAL"
+
+  # ═══════════════ 2 — TENANT SIGNS → ACTIVATE → SEED PERIODS ═══════════════
+  - name: tenant_sign
+    type: sign_deal
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+
+  - name: assert_deal_active
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      actual: "$tenant_sign.status"
+      equals: "ACTIVE"
+
+  # ═══════════ 2b — LANDLORD EXECUTES THE SETUP STEP (per-step consent) ═══════════
+  # The property account must deploy before any period can resolve
+  # $step.create_property.group_wallet_id. The landlord drives their own setup.
+  - name: landlord_execute_setup
+    type: execute_step
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+      step_id: create_property
+      find_timeout: 90
+
+  - name: await_setup_deploy
+    type: sleep
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { seconds: 120 }
+
+  # Snapshot the tenant's (underfunded) confidential AUD before anything fires.
+  - name: tenant_balance_before
+    type: balance
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { asset_id: aud-token-asset }
+
+  # ═══════════════ 3 — TENANT ARMS AUTO-PAY (owns the key) ═══════════════
+  - name: arm_autopay
+    type: set_automation_key
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+      key_label: "rent-autopay-late"
+
+  - name: assert_autopay_active
+    type: deal_automation_status
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+
+  - name: assert_autopay_is_active
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      actual: "$assert_autopay_active.active"
+      equals: "True"
+
+  # ═══════════════ 4 — THE CLOCK FIRES → REVERT → REAPER → FAILED ═══════════════
+  # Period 0 is due. The scheduler fires it under the tenant's auto-pay key, the
+  # rent step submits, and the on-chain confidential send REVERTS ("Insufficient
+  # balance" — the tenant has only 500 < 1000). That surfaces as a StepFailed,
+  # leaving the period at PROCESSING — and THIS is where the bug used to strand
+  # it forever. The per-tick reaper polls the dispatched message, classifies the
+  # revert as FUNDING, and drives the period to FAILED (retryable). Poll until
+  # period 0 is FAILED with retrying==true.
+  #
+  # ⚠️  PRE-FIX: this poll TIMES OUT at PROCESSING (the reaper doesn't exist),
+  #     so the suite FAILS here. That timeout IS the regression proof.
+  - name: period_0_failed_after_revert
+    type: deal_periods
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+      wait_for_status: FAILED
+      wait_period_index: 0
+      wait_timeout: 900
+      wait_interval: 5
+
+  - name: assert_period_0_failed
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      # The reaper drove the stuck PROCESSING period to FAILED on the funding
+      # revert (NOT left at PROCESSING). PRE-FIX this is still PROCESSING.
+      actual: "$period_0_failed_after_revert.period_0_status"
+      equals: "FAILED"
+
+  - name: assert_period_0_retrying
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      # A funding failure is RETRYABLE (in arrears), not a give-up: retry_count
+      # is below the cap so `retrying` is true. This distinguishes the funding
+      # path from a HARD revert (which would be FAILED-at-cap, retrying=false).
+      actual: "$period_0_failed_after_revert.period_0_retrying"
+      equals: "True"
+
+  # The failed attempt reverted on-chain, which DEBITS NOTHING — the tenant's
+  # balance is unchanged from before. Proves no money moved on the failed fire.
+  - name: tenant_balance_after_revert
+    type: balance
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { asset_id: aud-token-asset }
+
+  - name: assert_no_debit_on_revert
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      # delta == 0: a revert is atomic, so the underfunded fire moved nothing.
+      actual: "$tenant_balance_after_revert.private_balance"
+      minus:  "$tenant_balance_before.private_balance"
+      equals: "0"
+
+  # ═══════════════ 5 — FUND LATE ═══════════════
+  # Top the tenant up by one rent (500 + 1000 = 1500 ≥ 1000). The next backoff
+  # window will reschedule period 0 → SCHEDULED → the due-scan re-fires it, and
+  # now the send succeeds.
+  - name: fund_late
+    type: deposit
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      asset_id: aud-token-asset
+      amount: 1000000000000000000000
+      idempotency_key: late-funding-topup-$(cat /tmp/yf_late_funding_nonce)
+
+  - name: tenant_balance_after_topup
+    type: balance
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { asset_id: aud-token-asset }
+
+  # ═══════════════ 6 — AUTO-SETTLE (no manual retry) → COMPLETED ═══════════════
+  # The EXISTING `reschedule_retryable_failed_async` backoff sweep brings the
+  # FAILED period back to SCHEDULED once the backoff elapses; the due-scan
+  # re-fires it under the (now sufficiently funded) tenant key; the rent settles;
+  # the mirror flips the period COMPLETED. NO human action — pure auto-settle.
+  - name: period_0_auto_settled
+    type: deal_periods
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+      wait_for_status: COMPLETED
+      wait_period_index: 0
+      wait_timeout: 900
+      wait_interval: 5
+
+  - name: assert_period_0_completed
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      actual: "$period_0_auto_settled.period_0_status"
+      equals: "COMPLETED"
+
+  # INTEGRITY: COMPLETED must be backed by a REAL re-fired child workflow, not a
+  # bare status flip. The workflow_id is a fresh UUID (the reschedule cleared the
+  # old one and the re-fire stamped a new one), so it contains '-'.
+  - name: assert_period_0_ran_workflow
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      actual: "$period_0_auto_settled.period_0_workflow_id"
+      contains: "-"
+
+  # ═══════════════ 7 — EXACTLY ONE RENT MOVED (no double-pay) ═══════════════
+  # The tenant's confidential AUD fell by exactly one rent (1000) measured from
+  # the POST-TOPUP snapshot — proof the auto-settle moved money ONCE, despite the
+  # earlier failed fire (which moved nothing) and the reaper's FAILED→SCHEDULED
+  # re-fire (a NEW child workflow; the old failed step is abandoned, un-restarted,
+  # debits nothing).
+  - name: tenant_balance_final
+    type: balance
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { asset_id: aud-token-asset }
+
+  - name: assert_exactly_one_rent_paid
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      # delta (final − after_topup) == −1 rent. The whole point of the double-pay
+      # threat model: a revert + a re-fire must net to a SINGLE debit.
+      actual: "$tenant_balance_final.private_balance"
+      minus:  "$tenant_balance_after_topup.private_balance"
+      equals: "-1000000000000000000000"
+
+  # ───────── PROPERTY ACCOUNT RECEIVED EXACTLY ONE RENT ─────────
+  # The payee side of the no-double-pay proof: the fresh property group (nonce-
+  # named, starts at 0) holds EXACTLY one rent after it accepts the incoming
+  # confidential payment.
+  - name: property_ctx
+    type: whoami
+    user:
+      id: originator@yieldfabric.com
+      password: originator_password
+      group: "9 Late St — Property Account $(cat /tmp/yf_late_funding_nonce)"
+
+  - name: assert_property_account_real
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      actual: "$property_ctx.group_account_address"
+      contains: "0x"
+
+  - name: property_accept_rent
+    type: wait_for_accept_all
+    user:
+      id: originator@yieldfabric.com
+      password: originator_password
+      group: "9 Late St — Property Account $(cat /tmp/yf_late_funding_nonce)"
+    parameters:
+      asset_id: aud-token-asset
+      idempotency_key: late-funding-accept-$(cat /tmp/yf_late_funding_nonce)
+
+  - name: await_accept_settle
+    type: sleep
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters: { seconds: 30 }
+
+  - name: property_balance
+    type: balance
+    user:
+      id: originator@yieldfabric.com
+      password: originator_password
+      group: "9 Late St — Property Account $(cat /tmp/yf_late_funding_nonce)"
+    parameters: { asset_id: aud-token-asset }
+
+  - name: assert_property_received_one_rent
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      # EXACTLY one rent landed (1000 × 1e18). Fresh group per run ⇒ absolute
+      # assert is safe. End-to-end: tenant −1000, property +1000, same 1000 —
+      # ONE payment, despite the funding-failure round trip.
+      actual: "$property_balance.private_balance"
+      equals: "1000000000000000000000"
+
+  # ═══════════════ 8 — CLEAN UP: revoke auto-pay ═══════════════
+  - name: stop_autopay
+    type: revoke_automation_key
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+
+  - name: autopay_status_after_revoke
+    type: deal_automation_status
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+
+  - name: assert_autopay_stopped
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      actual: "$autopay_status_after_revoke.active"
+      equals: "False"

@@ -21,7 +21,7 @@ An issuer creates future payment obligations and atomically swaps them for immed
 Issuer creates obligation with **themselves as both obligor AND counterpart** to build structure without counterparty risk:
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -52,7 +52,7 @@ export ANNUITY_CONTRACT_ID="CONTRACT-OBLIGATION-1760932171982"
 ### Step 2: Accept the Annuity Stream Obligation
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -65,7 +65,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 ### Step 3: Create Redemption Obligation
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -92,7 +92,7 @@ export REDEMPTION_CONTRACT_ID="CONTRACT-OBLIGATION-1760932212849"
 ### Step 4: Accept the Redemption Obligation
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -107,7 +107,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 Exchange obligations for upfront payment:
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -131,7 +131,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 Counterpart pays 100 AUD upfront and receives obligation rights:
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $COUNTERPART_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -213,7 +213,7 @@ A sender distributes funds to multiple parties (e.g., dividend payout, commissio
 Sender creates a distribution specifying each recipient and amount:
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -234,7 +234,7 @@ Each recipient accepts their individual payment using the standard `accept` muta
 
 ```bash
 # Recipient 1 accepts
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $RECIPIENT1_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -242,7 +242,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
   }'
 
 # Recipient 2 accepts
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $RECIPIENT2_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -257,7 +257,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 If **no** recipient has accepted yet, the sender can cancel the entire distribution:
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -293,7 +293,7 @@ A borrower has an existing repo swap (Swap A) with Lender A. The borrower wants 
 The borrower (initiator / collateral provider) proposes a new repo:
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $BORROWER_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -313,7 +313,7 @@ curl -X POST https://pay.yieldfabric.com/graphql \
 The new lender completes the roll:
 
 ```bash
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $NEW_LENDER_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{

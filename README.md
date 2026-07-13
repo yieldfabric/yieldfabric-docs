@@ -62,8 +62,8 @@ YieldFabric provides **intelligent accounts** that enable sophisticated financia
 
 ### Service URLs
 - **Production Auth**: `https://auth.yieldfabric.com`
-- **Production API**: `https://pay.yieldfabric.com`
-- **GraphQL Endpoint**: `https://pay.yieldfabric.com/graphql`
+- **Production API**: `https://pay.test.yieldfabric.com`
+- **GraphQL Endpoint**: `https://pay.test.yieldfabric.com/graphql`
 
 ## Getting Started
 
@@ -88,11 +88,11 @@ export TOKEN=$(curl -s -X POST https://auth.yieldfabric.com/auth/login/with-serv
   | jq -r '.token')
 
 # Check balance
-curl -X GET "https://pay.yieldfabric.com/balance?denomination=aud-token-asset&obligor=null" \
+curl -X GET "https://pay.test.yieldfabric.com/balance?denomination=aud-token-asset&obligor=null" \
   -H "Authorization: Bearer $TOKEN" | jq
 
 # Send payment
-curl -X POST https://pay.yieldfabric.com/graphql \
+curl -X POST https://pay.test.yieldfabric.com/graphql \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{

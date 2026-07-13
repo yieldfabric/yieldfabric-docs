@@ -3,8 +3,8 @@
 ## Base URLs
 
 - **Auth Service**: `https://auth.yieldfabric.com`
-- **Payments/GraphQL Service**: `https://pay.yieldfabric.com`
-- **GraphQL Endpoint**: `https://pay.yieldfabric.com/graphql`
+- **Payments/GraphQL Service**: `https://pay.test.yieldfabric.com`
+- **GraphQL Endpoint**: `https://pay.test.yieldfabric.com/graphql`
 
 ---
 

@@ -69,7 +69,7 @@ class IssueWorkflowConfig:
         action_mode_override: Optional[str] = None,
     ) -> "IssueWorkflowConfig":
         """Build config from environment; CLI args (user, password, action_mode) override env when provided."""
-        pay = _env("PAY_SERVICE_URL", "https://pay.yieldfabric.com")
+        pay = _env("PAY_SERVICE_URL", "https://pay.test.yieldfabric.com")
         auth = _env("AUTH_SERVICE_URL", "https://auth.yieldfabric.com")
         denom = _env("DENOMINATION", "aud-token-asset")
         user_email = user_email_override or (
@@ -191,7 +191,7 @@ class PaymentWorkflowConfig:
     @classmethod
     def from_env(cls, script_dir: Path, csv_file: str) -> "PaymentWorkflowConfig":
         """Build config from environment (and default csv path)."""
-        pay = _env("PAY_SERVICE_URL", "https://pay.yieldfabric.com")
+        pay = _env("PAY_SERVICE_URL", "https://pay.test.yieldfabric.com")
         auth = _env("AUTH_SERVICE_URL", "https://auth.yieldfabric.com")
         denom = _env("DENOMINATION", "aud-token-asset")
         try:

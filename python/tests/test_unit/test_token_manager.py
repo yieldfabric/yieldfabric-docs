@@ -45,8 +45,8 @@ def test_user_token_logs_in_once_and_reuses_cached_token():
 
 def test_user_token_refreshes_with_refresh_token_instead_of_password_login():
     auth = MagicMock()
-    first = _jwt({"sub": "user-1", "exp": 1002, "chain_id": "31337"})
-    refreshed = _jwt({"sub": "user-1", "exp": 2000, "chain_id": "31337"})
+    first = _jwt({"sub": "user-1", "exp": 1002, "default_chain_id": "31337"})
+    refreshed = _jwt({"sub": "user-1", "exp": 2000, "default_chain_id": "31337"})
     auth.login_session.return_value = {
         "access_token": first,
         "refresh_token": "refresh-1",

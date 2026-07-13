@@ -135,6 +135,8 @@ query DealPeriods($dealId: String!) {
       startedAt
       completedAt
       hasRealised
+      retryCount
+      retrying
     }
   }
 }
@@ -752,6 +754,12 @@ class DealExecutor(BaseExecutor):
         token, err = self._acquire_token_or_error(command, use_delegation=False)
         if err:
             return err
+        # The wait_for_status poll below can run PAST the access-token TTL (900s)
+        # — e.g. waiting out the late-funding backoff window. Build a refresh-aware
+        # supplier (cached until near-expiry, then refreshed via the refresh token,
+        # same pattern as wait_executor) and re-resolve the token each iteration so
+        # a long poll doesn't 401 with "missing or invalid Bearer token" mid-wait.
+        token_supplier = self._token_supplier(command, use_delegation=False)
 
         deal_id = command.parameters.get("deal_id")
         if not deal_id:
@@ -773,6 +781,10 @@ class DealExecutor(BaseExecutor):
         periods: List[Any] = []
         while True:
             attempt += 1
+            # Refresh the token as needed before each poll (long waits outlive the
+            # 900s access-token TTL). Falls back to the prior token if the supplier
+            # transiently returns None.
+            token = token_supplier() or token
             response = self._graphql(_DEAL_PERIODS, {"dealId": str(deal_id)}, token)
             if not response.success:
                 return self._finalize_graphql_error(
@@ -786,12 +798,40 @@ class DealExecutor(BaseExecutor):
                 None,
             )
             cur = target.get("status") if isinstance(target, dict) else None
+            cur_retrying = bool(target.get("retrying")) if isinstance(target, dict) else False
             if cur == str(wait_for):
                 self.logger.success(
                     f"    ✅ period {wait_idx} reached {wait_for} after {attempt} poll(s)"
                 )
                 break
+            # FAILED handling. FAILED is a TRANSIENT state on the auto-settle
+            # path: the late-funding reaper flips a stuck PROCESSING period to
+            # FAILED (retrying=true) on a funding revert, then the backoff sweep
+            # re-SCHEDULEs and re-fires it → PROCESSING → COMPLETED. So when the
+            # caller is explicitly waiting for COMPLETED, a FAILED snapshot that
+            # is still RETRYING (retry budget not exhausted) is NOT terminal —
+            # keep polling, it is on its way to COMPLETED. Only stop early when
+            # FAILED can no longer advance to the target: either the caller is
+            # waiting for something other than COMPLETED, or the FAILED is itself
+            # terminal (retrying=false — a hard revert / exhausted backoff
+            # budget). Without this guard the COMPLETED-poll bails out on the
+            # very FAILED window the reaper deliberately produces, turning the
+            # late-funding regression suite into a false negative.
             if cur == "FAILED":
+                if str(wait_for) == "COMPLETED" and cur_retrying:
+                    if attempt == 1 or attempt % 6 == 0:
+                        self.logger.info(
+                            f"  ⏳ period {wait_idx} transiently FAILED (retrying) — "
+                            f"awaiting backoff re-fire → {wait_for} (attempt {attempt})"
+                        )
+                    if time.monotonic() >= deadline:
+                        self.logger.warning(
+                            f"    ⚠️  period {wait_idx} still FAILED (retrying) after "
+                            f"{timeout:.0f}s (wanted {wait_for}) — surfacing current state"
+                        )
+                        break
+                    time.sleep(interval)
+                    continue
                 # Terminal-but-not-the-target: stop polling and let the assert
                 # surface the FAILED state rather than spinning to the timeout.
                 self.logger.error(
@@ -829,6 +869,8 @@ class DealExecutor(BaseExecutor):
             outputs[f"period_{idx}_due_at"] = row.get("dueAt")
             outputs[f"period_{idx}_workflow_id"] = row.get("workflowId")
             outputs[f"period_{idx}_has_realised"] = bool(row.get("hasRealised"))
+            outputs[f"period_{idx}_retry_count"] = row.get("retryCount")
+            outputs[f"period_{idx}_retrying"] = bool(row.get("retrying"))
         outputs["completed_count"] = completed
 
         self.store_outputs(command.name, outputs)

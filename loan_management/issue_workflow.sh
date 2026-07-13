@@ -20,7 +20,7 @@ done
 # Configuration
 # To test locally, set: export PAY_SERVICE_URL=http://localhost:3002
 # To test locally, set: export AUTH_SERVICE_URL=http://localhost:3000
-PAY_SERVICE_URL="${PAY_SERVICE_URL:-https://pay.yieldfabric.com}"
+PAY_SERVICE_URL="${PAY_SERVICE_URL:-https://pay.test.yieldfabric.com}"
 AUTH_SERVICE_URL="${AUTH_SERVICE_URL:-https://auth.yieldfabric.com}"
 
 # Colors for output (matching executor scripts)

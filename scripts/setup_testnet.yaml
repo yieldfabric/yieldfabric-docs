@@ -43,22 +43,18 @@
 #     #     role: owner
 #     #   - id: collateral@yieldfabric.com # need to enable NFT owner
 #     #     role: owner
-    
+
 tokens:
   - id: AUD
     name: AUD Token
     description: AUD Token Description
-    address: 0x84e6E4a060D05621e4C7185c54DA389D30623Df3
+    address: 0x73662a0D244aA62F6CCb1655Ef5Fb065FAe7B8EF
     chain_id: 153
-  # - id: CBDC
-  #   name: CBDC Token
-  #   description: CBDC Token Description
-  #   address: 0xc5Eb600927cD1C5203fD4E6Ea280B6DBE6e2bFbd
-  #   chain_id: 153
-  - id: AUDM
-    name: AUDM Token
-    description: AUD Macropod Stablecoin
-    address: 0x3B175dADc3902F6F0F5469eCd10A44A843AAc800
+
+  - id: USDC
+    name: USDC Token
+    description: USDC Token Description
+    address: 0x91b1e94Ad2ab47c8B78B82D073128a59dC9485Fb
     chain_id: 153
 
 assets:
@@ -69,19 +65,12 @@ assets:
     description: AUD Token Description
     token_id: AUD-token
     
-  # - id: CBDC
-  #   name: CBDC Token
-  #   type: Cash
-  #   currency: AUD
-  #   description: CBDC Token Description
-  #   token_id: CBDC-token
-
-  - id: AUDM
-    name: AUDM Token
+  - id: USDC
+    name: USDC
     type: Cash
-    currency: AUD
-    description: AUD Macropod Stablecoin
-    token_id: AUDM-token
+    currency: USD
+    description: USDC Token Description
+    token_id: USDC-token
 
 # fiat_accounts:
 #   - id: AUDBANK-001

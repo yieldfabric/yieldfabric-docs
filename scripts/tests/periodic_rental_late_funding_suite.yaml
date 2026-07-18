@@ -137,18 +137,31 @@ commands:
       actual: "$propose_rental.deal_id"
       contains: "DEAL"
 
-  # ═══════════════ 2 — TENANT SIGNS → ACTIVATE → SEED PERIODS ═══════════════
+  # ═══════════════ 2 — TENANT SIGNS, LANDLORD ACTIVATES + SEEDS PERIODS ═══════════════
   - name: tenant_sign
     type: sign_deal
     user: { id: payer@yieldfabric.com, password: payer_password }
     parameters:
       deal_id: $propose_rental.deal_id
 
-  - name: assert_deal_active
+  - name: assert_deal_accepted
     type: assert
     user: { id: payer@yieldfabric.com, password: payer_password }
     parameters:
       actual: "$tenant_sign.status"
+      equals: "ACCEPTED"
+
+  - name: activate_rental
+    type: activate_deal
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+
+  - name: assert_deal_active
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      actual: "$activate_rental.status"
       equals: "ACTIVE"
 
   # ═══════════ 2b — LANDLORD EXECUTES THE SETUP STEP (per-step consent) ═══════════

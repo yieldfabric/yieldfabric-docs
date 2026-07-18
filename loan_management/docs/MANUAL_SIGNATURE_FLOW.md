@@ -1,17 +1,17 @@
 # Manual signature flow for messages
 
-This document describes how the **manual** signature flow works in the app, based on `yieldfabric-app/src/components/actions/SignaturePreviewDrawer.tsx` and related services.
+This document describes how the **manual** signature flow works in the wallet SDK, based on `yieldfabric-wallet-sdk/src/ui/signature/SignatureDrawer.tsx` and related services.
 
 **Linking Python:** To have Python trigger an operation that then requires manual signing in the app, see [LINKING_PYTHON_TO_MANUAL_SIGNATURE.md](./LINKING_PYTHON_TO_MANUAL_SIGNATURE.md).
 
 ## When the flow is used
 
 - The message must have **execution mode = Manual** (`message.execution_mode === 'Manual'`). Automatic messages do not open the drawer for manual sign.
-- The message must be in a signable state:
-  - `message.response?.status === 'manual_signature'`, or
-  - `message.executing === true`, or
-  - `message.response?.success === false` (retry after failure).
-- The drawer shows only if the message is **not** already successfully executed.
+- The message must have `message.response?.status === 'manual_signature'`
+  and no `executed` timestamp. `executing === true` is expected while the
+  wallet lane is parked, but it is not independently a signability signal.
+- Failed messages are inspect-only. A failed Manual command is corrected and
+  submitted as a fresh operation; its old browser-held signature is not reused.
 
 ## High-level steps
 
@@ -28,8 +28,11 @@ This document describes how the **manual** signature flow works in the app, base
 - **Service:** `messagesService.getUnsignedTransaction(userId, message.id)`
 - **Response:** Object that must include:
   - `message_hash` – Hex string (with or without `0x`) used as the payload to sign. **Required for signing.**
+  - `unsigned_transaction_id` – UUID generation token echoed with the signature. **Required for submission.**
   - Other fields: `id`, `source`, `account_address`, `chain_id`, `context`, optional `transactions`, etc.
-- **Failed messages (retry):** If `message.response?.success === false`, the drawer builds a **mock** unsigned transaction from `message.data` (no backend call for the initial load). When the user clicks Sign, it still fetches the unsigned transaction from the backend to get `message_hash` for consistency.
+- **Historical/failed messages:** Inspect mode may build a read-only preview
+  from `message.data` when the sealed unsigned row is unavailable. That mock
+  preview is never signable.
 
 ---
 
@@ -72,9 +75,12 @@ So for internal keys the app signs the **Keccak256 hash of the Ethereum Signed M
 ## 4. Submitting the signature
 
 - **API:** `POST /api/users/:userId/messages/:messageId/submit-signed-message`
-- **Body:** `{ signature: signatureHex }`
-- **Service:** `messagesService.confirmSignature(userId, message.id, signatureHex)`
-- **Retry path:** If the unsigned transaction had `source === 'retry'`, the app first calls `messagesService.retryFailedMessage(userId, message.id, ExecutionMode.Manual)` and then `confirmSignature(...)`.
+- **Body:** `{ signature: signatureHex, unsigned_transaction_id: unsignedTransactionId }`
+- **Service:** `messagesService.confirmSignature(userId, message.id, signatureHex, unsignedTransactionId)`
+- **Attempt fence:** `unsignedTransactionId` is returned with the exact
+  `message_hash` that was signed. A replacement generation returns `409` and
+  must be reviewed and signed again. Failed Manual commands are submitted as
+  corrected fresh operations; their browser-held signatures are never reused.
 
 After a successful `confirmSignature`, the drawer calls `onSignatureConfirmed()` so the parent can refresh or close.
 
@@ -83,12 +89,12 @@ After a successful `confirmSignature`, the drawer calls `onSignatureConfirmed()`
 ## Data flow summary
 
 ```
-Message (Manual, status manual_signature or executing or failed)
-    → GET unsigned-transaction  →  { message_hash, ... }
+Message (Manual, status manual_signature)
+    → GET unsigned-transaction  →  { message_hash, unsigned_transaction_id, ... }
     → User selects key (user or group keys)
     → If External: personal_sign(message_hash_hex) via MetaMask  →  signatureHex
     → If Internal: prefix+hash then POST /key-operations/sign     →  signatureHex
-    → POST submit-signed-message  { signature: signatureHex }
+    → POST submit-signed-message  { signature: signatureHex, unsigned_transaction_id }
     → onSignatureConfirmed()
 ```
 
@@ -98,8 +104,8 @@ Message (Manual, status manual_signature or executing or failed)
 
 | Step              | Method | Path                                                                 | Notes                          |
 |-------------------|--------|----------------------------------------------------------------------|--------------------------------|
-| Unsigned tx       | GET    | `/api/users/:userId/messages/:messageId/unsigned-transaction`       | Must return `message_hash`     |
-| Submit signature  | POST   | `/api/users/:userId/messages/:messageId/submit-signed-message`       | Body: `{ signature }`          |
+| Unsigned tx       | GET    | `/api/users/:userId/messages/:messageId/unsigned-transaction`       | Returns `message_hash` + `unsigned_transaction_id` |
+| Submit signature  | POST   | `/api/users/:userId/messages/:messageId/submit-signed-message`       | Body echoes signature + attempt ID |
 | User keys         | GET    | `/keys/users/:userId/keys`                                           | For key picker                 |
 | Group keys        | GET    | `/keys/auth/groups/:groupId/keypairs`                                | For key picker                 |
 | Sign (internal)   | POST   | `/key-operations/sign`                                               | For non-external keys only     |

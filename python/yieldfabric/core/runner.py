@@ -206,6 +206,12 @@ class YieldFabricRunner:
             elif response.success:
                 success_count += 1
             else:
+                # Executors return their actionable diagnostics on the
+                # CommandResponse. Surface them before the generic halt line;
+                # otherwise a timeout (for example wait_for_accept_all) looks
+                # like an unexplained failure even though the reason is known.
+                for error in response.errors or []:
+                    self.logger.error(f"    ❌ {error}")
                 command_broke = True
 
             self.logger.separator()
@@ -269,7 +275,9 @@ class YieldFabricRunner:
         # Route to appropriate executor. Keep this table in sync with the
         # shell harness `execute_commands.sh` dispatch so YAML files that
         # work in one work in the other.
-        if command_type in ["deposit", "withdraw", "instant", "accept", "accept_all"]:
+        if command_type in [
+            "deposit", "withdraw", "instant", "accept", "accept_all", "retry_message"
+        ]:
             return self.payment_executor.execute(command)
 
         elif command_type in ["create_obligation", "accept_obligation",
@@ -305,7 +313,7 @@ class YieldFabricRunner:
 
         elif command_type in [
             # Deal lifecycle + auto-pay (the dealFlow GraphQL on agents :3001).
-            "propose_deal", "sign_deal",
+            "propose_deal", "sign_deal", "activate_deal",
             "set_automation_key", "revoke_automation_key",
             "set_loan_collect_key", "revoke_loan_collect_key",
             "deal_automation_status", "deal_periods",

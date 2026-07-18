@@ -1090,9 +1090,12 @@ commands:
     user: { id: payer@yieldfabric.com, password: payer_password }
     parameters: { seconds: 6000 }
 
-  - name: t3b_expire
+  # expireSwap is permissionless after the deadline. Use an unrelated
+  # account so the suite proves the trigger does not impersonate the
+  # initiator and the initiator's escrowed assets are still returned.
+  - name: t3b_expire_by_outsider
     type: expire_swap
-    user: { id: payer@yieldfabric.com, password: payer_password }
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
     parameters:
       swap_id: "784002"
       idempotency_key: t3b-expire-$(date +%s)
@@ -1158,9 +1161,20 @@ commands:
       idempotency_key: t3c-repurchase-frozen-$(date +%s)
       expect_failure: true
 
-  - name: t3c_cancel_roll
+  # The old-repo counterparty is not a party to the new roll proposal.
+  - name: t3c_cancel_roll_by_outsider_fails
     type: cancel_roll
-    user: { id: payer@yieldfabric.com, password: payer_password }
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters:
+      new_swap_id: "785002"
+      idempotency_key: t3c-cancel-roll-outsider-$(date +%s)
+      expect_failure: true
+
+  # cancelRoll accepts either R2 party; exercise the new counterparty path,
+  # which previously failed in the resolver because it forced the initiator.
+  - name: t3c_cancel_roll_by_counterparty
+    type: cancel_roll
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
     parameters:
       new_swap_id: "785002"
       idempotency_key: t3c-cancel-roll-$(date +%s)

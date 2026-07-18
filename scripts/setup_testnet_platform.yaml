@@ -1,0 +1,106 @@
+# Run this fixture against the isolated chain-153 payments instance with:
+#
+#   CHAIN_ID=153 PAY_SERVICE_URL=http://localhost:3003 \
+#     python3 -m yieldfabric.cli setup ../scripts/setup_testnet_platform.yaml
+#
+# PAY_SERVICE_URL selects payments-direct calls. CHAIN_ID pins every auth
+# session to 153, which makes auth route account activation to its configured
+# services.payments_urls["153"] entry (:3003 locally).
+
+users:
+  - id: payer@yieldfabric.com
+    password: payer_password
+    role: SuperAdmin
+
+  - id: originator@yieldfabric.com
+    password: originator_password
+    role: SuperAdmin
+
+  - id: collateral@yieldfabric.com
+    password: collateral_password
+    role: SuperAdmin
+
+  - id: issuer@yieldfabric.com
+    password: issuer_password
+    role: SuperAdmin
+
+  - id: investor@yieldfabric.com
+    password: investor_password
+    role: SuperAdmin
+
+groups:
+  - id: collateral-group
+    name: Collateral Group
+    description: Collateral Group Description
+    group_type: project
+    user:
+      id: collateral@yieldfabric.com
+      password: collateral_password
+    # members:
+    #   - id: issuer@yieldfabric.com # need to enable NFT owner
+    #     role: owner
+
+  - id: issuer-group
+    name: Issuer Group
+    description: Issuer Group Description
+    group_type: project
+    user:
+      id: issuer@yieldfabric.com
+      password: issuer_password
+    # members:
+    #   - id: investor@yieldfabric.com
+    #     role: owner
+    #   - id: collateral@yieldfabric.com # need to enable NFT owner
+    #     role: owner
+
+# tokens:
+#   - id: AUD
+#     name: AUD Token
+#     description: AUD Token Description
+#     address: 0x73662a0D244aA62F6CCb1655Ef5Fb065FAe7B8EF
+#     chain_id: 153
+
+#   - id: USDC
+#     name: USDC Token
+#     description: USDC Token Description
+#     address: 0x91b1e94Ad2ab47c8B78B82D073128a59dC9485Fb
+#     chain_id: 153
+
+# assets:
+#   - id: AUD
+#     name: AUD Token
+#     type: Cash
+#     currency: AUD
+#     description: AUD Token Description
+#     token_id: AUD-token
+    
+#   - id: USDC
+#     name: USDC
+#     type: Cash
+#     currency: USD
+#     description: USDC Token Description
+#     token_id: USDC-token
+
+# fiat_accounts:
+#   - id: AUDBANK-001
+#     user:
+#       id: issuer@yieldfabric.com
+#       password: issuerpass456
+#     holder: Personal Inc
+#     currency: AUD
+#     iban: AU12ABCD1234567890123456
+#     bsb: 012345
+#     account_number: 123456789
+#     asset: aud-token-asset
+
+#   - id: USDBANK-002
+#     user:
+#       id: admin2@yieldfabric.com
+#       password: testpass123
+#       group: Admin Group
+#     holder: YieldFabric Inc
+#     currency: USD
+#     iban: US12ABCD1234567890123456
+#     routing_number: 123456789
+#     account_number: 123456789
+#     asset: usd-token-asset

@@ -27,6 +27,15 @@ class YieldFabricConfig:
         default_factory=lambda: os.getenv('AGENTS_SERVICE_URL', 'http://localhost:3001')
     )
 
+    # Optional chain pin for CLI sessions. Payments-direct calls use
+    # PAY_SERVICE_URL, while account activation goes through auth and is
+    # routed from the JWT's default_chain_id. When CHAIN_ID is set, every
+    # password/API-key login is minted or refreshed onto that chain first so
+    # both paths target the same payments instance.
+    chain_id: Optional[str] = field(
+        default_factory=lambda: (os.getenv('CHAIN_ID') or '').strip() or None
+    )
+
     # API key for backend-service authentication (preferred over
     # email/password for non-interactive callers like setup). When set,
     # the runner exchanges it for a short-lived JWT at boot via
@@ -112,6 +121,7 @@ class YieldFabricConfig:
             pay_service_url=config_dict.get('pay_service_url', defaults.pay_service_url),
             auth_service_url=config_dict.get('auth_service_url', defaults.auth_service_url),
             agents_service_url=config_dict.get('agents_service_url', defaults.agents_service_url),
+            chain_id=config_dict.get('chain_id', defaults.chain_id),
             api_key=config_dict.get('api_key', defaults.api_key),
             command_delay=config_dict.get('command_delay', defaults.command_delay),
             debug=config_dict.get('debug', defaults.debug),
@@ -127,6 +137,7 @@ class YieldFabricConfig:
             'pay_service_url': self.pay_service_url,
             'auth_service_url': self.auth_service_url,
             'agents_service_url': self.agents_service_url,
+            'chain_id': self.chain_id,
             'api_key': self.api_key,
             'command_delay': self.command_delay,
             'debug': self.debug,
@@ -142,6 +153,10 @@ class YieldFabricConfig:
             raise ValueError("pay_service_url is required")
         if not self.auth_service_url:
             raise ValueError("auth_service_url is required")
+        if self.chain_id is not None and (
+            not str(self.chain_id).isdigit() or int(self.chain_id) <= 0
+        ):
+            raise ValueError("chain_id must be a positive decimal chain ID")
         if self.command_delay < 0:
             raise ValueError("command_delay must be non-negative")
         if self.request_timeout < 1:
@@ -151,4 +166,3 @@ class YieldFabricConfig:
         if self.jwt_expiry_seconds < 60:
             raise ValueError("jwt_expiry_seconds must be at least 60 seconds")
         return True
-

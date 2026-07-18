@@ -1,12 +1,13 @@
 """
 Payment operations executor — deposit, withdraw, instant, accept,
-accept_all. Every mutation returns a `message_id`; callers can set
-`wait: true` on the command to block until the MQ consumer has
-executed it (see BaseExecutor._maybe_wait_for_execution).
+accept_all. Single operations return `message_id`; batch operations return
+`message_ids`. Unless explicitly disabled with `wait: false`, callers block
+until every MQ message has executed and completed graph post-processing.
 """
 
 from .base import BaseExecutor
 from ..models import Command, CommandResponse
+from ..utils.jwt import get_entity_id
 from ..utils.graphql import GraphQLMutation
 from ..utils.validators import is_provided
 
@@ -22,6 +23,7 @@ class PaymentExecutor(BaseExecutor):
             "instant": self._execute_instant,
             "accept": self._execute_accept,
             "accept_all": self._execute_accept_all,
+            "retry_message": self._execute_retry_message,
         }
         handler = dispatch.get(command_type)
         if handler is None:
@@ -236,14 +238,91 @@ class PaymentExecutor(BaseExecutor):
 
         outputs = {
             "account_address": data.get("accountAddress"),
+            "disposition": data.get("disposition"),
             "message": data.get("message"),
             "id_hash": data.get("idHash"),
             "message_id": data.get("messageId"),
+            "transaction_id": data.get("transactionId"),
             "accept_result": data.get("acceptResult"),
             "timestamp": data.get("timestamp"),
         }
         return self._finalize_success(
             command, token, outputs, success_message="Accept successful!",
+        )
+
+    def _execute_retry_message(self, command: Command) -> CommandResponse:
+        """Redrive the same failed canonical payment Retrieve and wait for it."""
+        self.log_command_start(command)
+        token, err = self._acquire_token_or_error(command)
+        if err:
+            return err
+
+        params = command.parameters
+        message_id = params.get("message_id")
+        raw_mode = params.get("execution_mode") or "Automatic"
+        execution_mode = {
+            "automatic": "Automatic",
+        }.get(str(raw_mode).strip().lower())
+        entity_id = params.get("user_id") or get_entity_id(token)
+
+        self.log_parameters({
+            "message_id": message_id,
+            "execution_mode": raw_mode,
+        })
+
+        if not message_id:
+            self.log_command_failure(command)
+            return CommandResponse.error_response(
+                command.name,
+                command.type,
+                ["retry_message requires `message_id`"],
+            )
+        if execution_mode is None:
+            self.log_command_failure(command)
+            return CommandResponse.error_response(
+                command.name,
+                command.type,
+                ["retry_message only supports `Automatic` execution_mode"],
+            )
+        if not entity_id:
+            self.log_command_failure(command)
+            return CommandResponse.error_response(
+                command.name,
+                command.type,
+                ["Could not derive the message owner from the JWT"],
+            )
+
+        result = self.payments_service.retry_message(
+            entity_id,
+            str(message_id),
+            execution_mode,
+            token,
+        )
+        if not result.get("success"):
+            return self._finalize_business_error(
+                command,
+                result.get("message", "Message retry was not accepted"),
+                operation_name="Retry message",
+            )
+
+        returned_message_id = result.get("message_id")
+        if str(returned_message_id or "") != str(message_id):
+            return self._finalize_business_error(
+                command,
+                "Retry did not return the same message_id; canonical redrive was not preserved",
+                operation_name="Retry message",
+            )
+
+        outputs = {
+            "message": result.get("message"),
+            "message_id": str(message_id),
+            "execution_mode": result.get("execution_mode") or execution_mode,
+        }
+        return self._finalize_success(
+            command,
+            token,
+            outputs,
+            success_message="Canonical message redrive completed!",
         )
 
     def _execute_accept_all(self, command: Command) -> CommandResponse:
@@ -252,10 +331,10 @@ class PaymentExecutor(BaseExecutor):
         optionally filtered by `denomination` + `obligor`. Mirrors the
         shell's `execute_accept_all` (executors.sh:544).
 
-        Unlike the per-message mutations, `acceptAll` returns bulk
-        counts rather than a single `message_id`, so the `wait: true`
-        per-command flag is a no-op here. Use the `wait_for_accept_all`
-        command type for poll-until-accepted-count-> 0 semantics.
+        `acceptAll` returns one durable message id per accepted payment.
+        Preserve all of them so the shared batch waiter can block until
+        execution and graph post-processing finish. `wait_for_accept_all`
+        remains useful when the payable itself may not have materialised yet.
         """
         self.log_command_start(command)
         token, err = self._acquire_token_or_error(command)
@@ -298,11 +377,33 @@ class PaymentExecutor(BaseExecutor):
                 operation_name="AcceptAll",
             )
 
+        accepted_payments = data.get("acceptedPayments") or []
+        failed_payments = data.get("failedPayments") or []
+        message_ids = self._normalize_message_ids(
+            payment.get("messageId")
+            for payment in accepted_payments
+            if isinstance(payment, dict)
+        )
+        accepted_count = int(data.get("acceptedCount") or 0)
+        if accepted_count != len(message_ids):
+            return self._finalize_business_error(
+                command,
+                (
+                    "acceptAll returned "
+                    f"{accepted_count} accepted payment(s) but "
+                    f"{len(message_ids)} distinct durable message id(s)"
+                ),
+                operation_name="AcceptAll",
+            )
+
         outputs = {
             "message": data.get("message"),
             "total_payments": data.get("totalPayments"),
-            "accepted_count": data.get("acceptedCount"),
+            "accepted_count": accepted_count,
             "failed_count": data.get("failedCount"),
+            "accepted_payments": accepted_payments,
+            "failed_payments": failed_payments,
+            "message_ids": message_ids,
             "denomination": denomination,
             "obligor": params.obligor,
             "timestamp": data.get("timestamp"),

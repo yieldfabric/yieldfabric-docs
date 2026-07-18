@@ -4,7 +4,7 @@
 #
 #  Unlike loan_origination_suite.yaml (which calls the payments operations
 #  directly), THIS drives the actual `loan` deal TEMPLATE through the DMS:
-#    proposeDeal(template plan.json) → sign (auto-activates → compile_to_pipeline)
+#    proposeDeal(template plan.json) → sign → proposer activateDeal
 #    → execute_step each of the 6 nodes as its assignee → verify the disbursement.
 #  This is what exercises compile_to_pipeline + the deal-flow workflow — the code
 #  the template change actually touches.
@@ -50,7 +50,7 @@ commands:
     user: { id: payer@yieldfabric.com, password: payer_password }
     parameters: { asset_id: aud-token-asset }
 
-  # ───────── PROPOSE the ACTUAL template + sign (auto-activate ⇒ DMS compiles it) ─────────
+  # ───────── PROPOSE + SIGN + EXPLICIT PROPOSER ACTIVATION ─────────
   - name: propose
     type: propose_deal
     user: { id: issuer@yieldfabric.com, password: issuer_password }
@@ -59,10 +59,25 @@ commands:
       parties: [ { entity_id: "$borrower_ctx.user_id", role: borrower } ]
       name: "Origination loan (DMS e2e)"
       idempotency_key: lod-propose-$(cat /tmp/yf_lod_nonce)
-  - name: sign                # the borrower (last/only signer) signs ⇒ deal goes ACTIVE
+  - name: sign                # the borrower (last/only counterparty) signs ⇒ ACCEPTED
     type: sign_deal
     user: { id: payer@yieldfabric.com, password: payer_password }
     parameters: { deal_id: "$propose.deal_id" }
+
+  - name: assert_accepted
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { actual: "$sign.status", equals: "ACCEPTED" }
+
+  - name: activate
+    type: activate_deal
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { deal_id: "$propose.deal_id" }
+
+  - name: assert_active
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { actual: "$activate.status", equals: "ACTIVE" }
 
   # ───────── DRIVE each node through the deal-flow, as its assignee ─────────
   - name: exec_create_account

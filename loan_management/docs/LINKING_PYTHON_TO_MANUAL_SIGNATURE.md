@@ -24,12 +24,17 @@ This doc explains two ways to complete the manual signature flow:
 
 **New messages (at creation):** No. When a message is created (e.g. via acceptObligation, completeSwap), the backend does **not** accept an `execution_mode` on the message. The payments service always enqueues with `Automatic`; the MQ then applies **wallet execution mode preference** for `(wallet_id, message_type)`. So to get manual signature for a new message you must set the **wallet** to Manual for that message type (e.g. `PUT /api/wallets/{wallet_id}/execution-mode-preferences/AcceptObligation` with `"Manual"`). Every message created for that wallet + type will then require manual signature.
 
-**Existing failed message (retry):** Yes. You can flag that **specific** message to manual signature when retrying:  
-`POST /api/users/{user_id}/messages/{message_id}/retry`  
-Body: `{ "execution_mode": "Manual" }` (or `"Automatic"`).  
-That updates the message’s `execution_mode` to Manual and re-queues it (only for messages with `has_error = true`). Retries default to Manual if you omit the field.
+**Existing failed message:** No mode conversion is supported. A failed Manual
+command is inspect-only; correct the condition and submit a fresh typed command,
+which creates a fresh unsigned-transaction generation. The public
+`POST /api/users/{user_id}/messages/{message_id}/retry` resource is deliberately
+narrow: it redrives only a failed, fully post-processed `Retrieve` whose stored
+mode is already `Automatic`, and its body may only request
+`{ "execution_mode": "Automatic" }`. It preserves the canonical payment-claim
+message id and never changes execution mode.
 
-So: **per-message manual** is only supported for **retry** of failed messages. For new messages, use **wallet-level** Manual preference.
+So: **per-message Manual is not a retry feature**. Use the wallet-level Manual
+preference before submitting a new operation.
 
 ## End-to-end flow
 
@@ -95,10 +100,14 @@ Other operations (complete swap, retrieve, deposit, send, etc.) work the same wa
 
 - User opens the app, goes to the wallet/actions view where “awaiting signature” messages are shown (or the main message list).
 - Clicks the message → **SignaturePreviewDrawer** opens.
-- App calls `GET /api/users/{user_id}/messages/{message_id}/unsigned-transaction` (payments adds `message_hash`).
+- App calls `GET /api/users/{user_id}/messages/{message_id}/unsigned-transaction` (payments adds `message_hash` and the attempt-bound `unsigned_transaction_id`).
 - User selects a key (e.g. issuer external key registered for that loan wallet).
 - User signs (MetaMask for external key, or API for internal key).
-- App calls `POST /api/users/{user_id}/messages/{message_id}/submit-signed-message` with `{ "signature": "<hex>" }`.
+- App calls `POST /api/users/{user_id}/messages/{message_id}/submit-signed-message` with `{ "signature": "<hex>", "unsigned_transaction_id": "<UUID returned by GET>" }`.
+
+The ID must come from the same GET response whose `message_hash` was signed.
+If the transaction is rebuilt before submission, payments returns `409`; the
+app reloads and asks the user to review and sign the current transaction.
 
 No change needed in Python for this step; it’s the existing app flow (see [MANUAL_SIGNATURE_FLOW.md](./MANUAL_SIGNATURE_FLOW.md)).
 

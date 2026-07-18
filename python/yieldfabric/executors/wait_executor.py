@@ -503,20 +503,45 @@ class WaitExecutor(BaseExecutor):
             )
 
         observation = result.observation
+        accepted_payments = observation.get("acceptedPayments") or []
+        failed_payments = observation.get("failedPayments") or []
+        message_ids = self._normalize_message_ids(
+            payment.get("messageId")
+            for payment in accepted_payments
+            if isinstance(payment, dict)
+        )
+        accepted_count = int(observation.get("acceptedCount") or 0)
+        if accepted_count != len(message_ids):
+            self.log_command_failure(command)
+            return CommandResponse.error_response(
+                command.name,
+                command.type,
+                [
+                    "acceptAll returned "
+                    f"{accepted_count} accepted payment(s) but "
+                    f"{len(message_ids)} distinct durable message id(s)"
+                ],
+            )
+
         outputs = {
             "denomination": denomination,
             "total_payments": observation.get("totalPayments"),
-            "accepted_count": observation.get("acceptedCount"),
+            "accepted_count": accepted_count,
             "failed_count": observation.get("failedCount"),
+            "accepted_payments": accepted_payments,
+            "failed_payments": failed_payments,
+            "message_ids": message_ids,
             "message": observation.get("message"),
             "attempts": result.attempts,
             "elapsed": result.elapsed,
         }
-        self.store_outputs(command.name, outputs)
-        self.logger.success(
-            f"  ✅ accept_all {denomination}: accepted={outputs['accepted_count']} "
-            f"failed={outputs['failed_count']} "
-            f"in {result.attempts} attempt(s) / {result.elapsed:.1f}s"
+        return self._finalize_success(
+            command,
+            token,
+            outputs,
+            success_message=(
+                f"accept_all {denomination}: accepted={outputs['accepted_count']} "
+                f"failed={outputs['failed_count']} "
+                f"in {result.attempts} attempt(s) / {result.elapsed:.1f}s"
+            ),
         )
-        self.log_command_success(command)
-        return CommandResponse.success_response(command.name, command.type, outputs)

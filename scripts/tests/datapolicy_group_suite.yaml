@@ -38,6 +38,7 @@
 #  Parties (seeded SuperAdmins; see setup.yaml):
 #    issuer@yieldfabric.com     — owner of "Issuer Group"  → registers + APPROVES the policy
 #    collateral@yieldfabric.com — restricted policymember  → EXECUTOR (policy holder) + trigger
+#    payer@yieldfabric.com      — non-registrar signer used to keep the unapproved fixture at 0/1
 #    (the relay / VAULT_PRIVATE_KEY only submits the meta-tx; it is NOT a policy participant)
 #
 #  ⚠️  ENV-SPECIFIC CONSTANT — the AUD token's on-chain CONTRACT address. It MUST be
@@ -111,6 +112,12 @@ commands:
   - name: member_ctx
     type: whoami
     user: { id: collateral@yieldfabric.com, password: collateral_password }
+
+  # A distinct signer for the negative unapproved-policy fixture. Because payer is not the
+  # issuer-registrar, registration cannot auto-collect this approval.
+  - name: unapproved_signer_ctx
+    type: whoami
+    user: { id: payer@yieldfabric.com, password: payer_password }
 
   # NOTE: collateral is deliberately NOT added as a member here. Registering the data policy below
   # (happy_add_policy, naming collateral in `executor_accounts`) IS what makes collateral a restricted
@@ -286,6 +293,8 @@ commands:
   # ════════════════════════════ NEGATIVE GUARDS ════════════════════════════
 
   # ─── A — execute BEFORE approval (policy 9011 registered but never approved) ───
+  # Registrar approval is auto-recorded only when the registrar is in the approver set. Naming
+  # payer as the sole signer deliberately leaves this policy at 0/1 after issuer registers it.
   - name: a_add_unapproved
     type: add_data_policy
     user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
@@ -296,7 +305,7 @@ commands:
       expiry: "$(date -v+365d +%s)"
       max_use: "5"
       min_signatories: 1
-      required_signers: [ $owner_self_ctx.default_wallet_id ]
+      required_signers: [ $unapproved_signer_ctx.default_wallet_id ]
       executor_accounts: [ $member_ctx.default_wallet_id ]   # collateral = policy holder / executor (its account I is msg.sender at G via relay→I→G)
       allowed_operations: [ send ]
       amount_bounds:

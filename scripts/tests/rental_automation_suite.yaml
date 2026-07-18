@@ -188,20 +188,33 @@ commands:
       actual: "$propose_rental.deal_id"
       contains: "DEAL"
 
-  # ═══════════════ 2 — TENANT SIGNS → ACTIVATE ═══════════════
-  # The proposer auto-signs at propose; the tenant's signature flips the deal
-  # Proposed → Active and starts the setup workflow.
+  # ═══════════════ 2 — TENANT SIGNS, THEN LANDLORD ACTIVATES ═══════════════
+  # The proposer auto-signs at propose; the tenant's signature moves the deal
+  # Proposed → Accepted. The proposer then starts the setup workflow.
   - name: tenant_sign
     type: sign_deal
     user: { id: payer@yieldfabric.com, password: payer_password }
     parameters:
       deal_id: $propose_rental.deal_id
 
-  - name: assert_deal_active
+  - name: assert_deal_accepted
     type: assert
     user: { id: payer@yieldfabric.com, password: payer_password }
     parameters:
       actual: "$tenant_sign.status"
+      equals: "ACCEPTED"
+
+  - name: activate_rental
+    type: activate_deal
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+
+  - name: assert_deal_active
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      actual: "$activate_rental.status"
       equals: "ACTIVE"
 
   # ═══════════════ 3 — DRIVE THE SETUP STEPS (see caveat A) ═══════════════
@@ -375,24 +388,15 @@ commands:
       minus:  "$tenant_cash_before_settle.private_balance"
       equals: "-1000000000000000000000"
 
-  # The settlement cash lands as a PENDING payable for the group (the worker
-  # drives collect/swap/settle but not the group's final claim — same as the
-  # manual flow's explicit group_claim_settlement). The group pulls it via
-  # acceptAll (acting AS the group), then its private_balance reflects the rent.
-  - name: group_claim_settlement
-    type: wait_for_accept_all
-    user:
-      id: originator@yieldfabric.com
-      password: originator_password
-      group: "12 Smith St — Property Account $(cat /tmp/yf_rental_auto_nonce)"
-    parameters:
-      asset_id: aud-token-asset
-      idempotency_key: rental-auto-claim-$(cat /tmp/yf_rental_auto_nonce)
-
-  - name: await_claim_settle
+  # Group wallets are default-on for wallet auto-accept. Once the tenant's
+  # settlement creates the group's PENDING cash payment, that independent
+  # scheduler claims it; a manual acceptAll here races the scheduler and then
+  # times out after the scheduler wins. Its longest idle cadence is ~80s, with
+  # a small allowance for the retrieve transaction to settle on-chain.
+  - name: await_group_auto_accept
     type: sleep
     user: { id: originator@yieldfabric.com, password: originator_password }
-    parameters: { seconds: 30 }
+    parameters: { seconds: 90 }
 
   - name: group_cash_after
     type: balance

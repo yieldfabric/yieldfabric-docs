@@ -140,9 +140,10 @@ commands:
       actual: "$propose_rental.deal_id"
       contains: "DEAL"
 
-  # ═══════════════ 2 — TENANT SIGNS → ACTIVATE → SEED PERIODS ═══════════════
-  # The proposer auto-signs at propose; the tenant's signature is the last,
-  # flipping the deal Proposed → Active. activate seeds one SCHEDULED
+  # ═══════════════ 2 — TENANT SIGNS, LANDLORD ACTIVATES + SEEDS PERIODS ═══════════════
+  # The proposer auto-signs at propose; the tenant's signature is the last
+  # counterparty signature and moves the deal Proposed → Accepted. The
+  # proposer's explicit activate_deal call seeds one SCHEDULED
   # deal_periods row per period (12), each with its due_at from the schedule,
   # and starts the parent setup workflow — but its `create_property` step
   # DEFERS to the landlord's inbox (per-step consent, see 2b below); it does
@@ -153,12 +154,25 @@ commands:
     parameters:
       deal_id: $propose_rental.deal_id
 
-  - name: assert_deal_active
+  - name: assert_deal_accepted
     type: assert
     user: { id: payer@yieldfabric.com, password: payer_password }
     parameters:
-      # GraphQL serialises DealStatus in SCREAMING form — ACTIVE, not Active.
+      # GraphQL serialises DealStatus in SCREAMING form.
       actual: "$tenant_sign.status"
+      equals: "ACCEPTED"
+
+  - name: activate_rental
+    type: activate_deal
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      deal_id: $propose_rental.deal_id
+
+  - name: assert_deal_active
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      actual: "$activate_rental.status"
       equals: "ACTIVE"
 
   # ═══════════ 2b — LANDLORD EXECUTES THE SETUP STEP (per-step consent) ═══════════

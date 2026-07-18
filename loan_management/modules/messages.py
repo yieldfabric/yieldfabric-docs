@@ -25,8 +25,9 @@ def get_unsigned_transaction(
 ) -> dict:
     """
     GET /api/users/{user_id}/messages/{message_id}/unsigned-transaction.
-    Returns dict with message_hash (hex), id, account_address, chain_id, context, etc.
-    Required for signing: response["message_hash"].
+    Returns dict with message_hash (hex), unsigned_transaction_id,
+    account_address, chain_id, context, etc. Both message_hash and
+    unsigned_transaction_id must be carried into signature submission.
     Raises RuntimeError if not found (404) or other error.
     """
     url = f"{pay_service_url.rstrip('/')}/api/users/{user_id}/messages/{message_id}/unsigned-transaction"
@@ -81,18 +82,29 @@ def submit_signed_message(
     user_id: str,
     message_id: str,
     signature_hex: str,
+    unsigned_transaction_id: str,
     timeout: int = 15,
 ) -> dict:
     """
     POST /api/users/{user_id}/messages/{message_id}/submit-signed-message.
-    Body: { "signature": "<hex with 0x>" }. Returns success/status.
+    Body: { "signature": "<hex with 0x>",
+            "unsigned_transaction_id": "<UUID from GET>" }.
+    Returns success/status.
     """
     sig = (signature_hex or "").strip()
     if not sig.startswith("0x"):
         sig = "0x" + sig
     url = f"{pay_service_url.rstrip('/')}/api/users/{user_id}/messages/{message_id}/submit-signed-message"
     headers = auth_headers(jwt_token)
-    resp = requests.post(url, json={"signature": sig}, headers=headers, timeout=timeout)
+    resp = requests.post(
+        url,
+        json={
+            "signature": sig,
+            "unsigned_transaction_id": unsigned_transaction_id,
+        },
+        headers=headers,
+        timeout=timeout,
+    )
     if resp.status_code != 200:
         try:
             err = resp.json()
@@ -207,17 +219,48 @@ def sign_and_submit_manual_message(
 
     Returns the response from submit-signed-message (success, message_id, status).
     """
-    from .register_external_key import sign_message_hash_manual_flow
-
     unsigned = get_unsigned_transaction(
         pay_service_url, jwt_token, user_id, message_id, timeout=timeout
     )
+    return _sign_and_submit_unsigned_transaction(
+        pay_service_url,
+        jwt_token,
+        user_id,
+        message_id,
+        private_key_hex,
+        unsigned,
+        timeout=timeout,
+    )
+
+
+def _sign_and_submit_unsigned_transaction(
+    pay_service_url: str,
+    jwt_token: str,
+    user_id: str,
+    message_id: str,
+    private_key_hex: str,
+    unsigned: dict,
+    timeout: int,
+) -> dict:
+    """Sign and submit one exact backend-issued unsigned generation."""
+    from .register_external_key import sign_message_hash_manual_flow
+
     message_hash = unsigned.get("message_hash")
     if not message_hash:
         raise RuntimeError("Unsigned transaction has no message_hash")
+    unsigned_transaction_id = unsigned.get("unsigned_transaction_id")
+    if not isinstance(unsigned_transaction_id, str) or not unsigned_transaction_id.strip():
+        raise RuntimeError("Unsigned transaction has no unsigned_transaction_id")
+
     signature_hex = sign_message_hash_manual_flow(private_key_hex, message_hash)
     return submit_signed_message(
-        pay_service_url, jwt_token, user_id, message_id, signature_hex, timeout=timeout
+        pay_service_url,
+        jwt_token,
+        user_id,
+        message_id,
+        signature_hex,
+        unsigned_transaction_id,
+        timeout=timeout,
     )
 
 
@@ -244,7 +287,7 @@ def poll_until_sign_and_submit_manual_message(
 
     Returns the response from submit-signed-message.
     """
-    wait_for_unsigned_transaction_ready(
+    unsigned = wait_for_unsigned_transaction_ready(
         pay_service_url,
         jwt_token,
         user_id,
@@ -253,6 +296,12 @@ def poll_until_sign_and_submit_manual_message(
         max_wait_seconds=max_wait_seconds,
         timeout_per_request=timeout_per_request,
     )
-    return sign_and_submit_manual_message(
-        pay_service_url, jwt_token, user_id, message_id, private_key_hex, timeout=timeout_per_request
+    return _sign_and_submit_unsigned_transaction(
+        pay_service_url,
+        jwt_token,
+        user_id,
+        message_id,
+        private_key_hex,
+        unsigned,
+        timeout=timeout_per_request,
     )

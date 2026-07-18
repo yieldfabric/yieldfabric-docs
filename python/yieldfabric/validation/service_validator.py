@@ -71,8 +71,7 @@ class ServiceValidator:
                 self.logger.warning(
                     f"⚠️  Agents service is not reachable at {self.agents_service.base_url} "
                     "— deal-lifecycle commands (propose_deal / sign_deal / "
-                    "set_automation_key / deal_periods) will fail until it's up"
+                    "activate_deal / set_automation_key / deal_periods) will fail until it's up"
                 )
 
         return auth_healthy and payments_healthy
-

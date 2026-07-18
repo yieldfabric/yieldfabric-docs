@@ -6,7 +6,8 @@ Exercises the periodic-deal engine + the user-managed auto-pay credential
 system end to end:
 
     propose_deal           → dealFlow.proposeDeal      (raw DealPlan in)
-    sign_deal              → dealFlow.signDeal         (last signer ⇒ Active + seed periods)
+    sign_deal              → dealFlow.signDeal         (all signatures ⇒ Accepted)
+    activate_deal          → dealFlow.activateDeal     (proposer only; Accepted ⇒ Active)
     set_automation_key     → POST /auth/api-key/generate (caller mints a yf_api_… key)
                              then dealFlow.setDealAutomationKey (seal it to the deal)
     deal_automation_status → dealFlow.dealAutomationStatus  (non-secret status; read)
@@ -14,14 +15,16 @@ system end to end:
     deal_periods           → dealFlow.dealPeriods      (per-period status; read)
 
 Unlike the payment executors, deal mutations do NOT return an MQ
-`message_id` to poll — `proposeDeal`/`signDeal` return a `Deal`, and the
-scheduler fires periods out-of-band on the wall clock. So these methods
-store outputs and return directly; the suite sequences with `sleep`.
+`message_id` to poll — `proposeDeal`/`signDeal`/`activateDeal` return a
+`Deal`, and the scheduler fires periods out-of-band on the wall clock. So
+these methods store outputs and return directly; the suite sequences with
+`sleep`.
 
-Auth: every call carries the caller's own user JWT (acquired via the
-base executor). The agents request-auth middleware signature-validates it
-before any resolver runs, and the deal resolvers gate on deal-party
-membership (`require_caller_is_principal`).
+Auth: every call carries the caller's JWT (acquired via the base executor).
+Commands act as the user by default; proposer/activation/step commands honor
+an explicitly supplied `user.group` delegation. The agents request-auth
+middleware signature-validates the token before any resolver runs, and the
+deal resolvers gate on deal-party membership (`require_caller_is_principal`).
 """
 
 import json
@@ -61,6 +64,18 @@ mutation SignDeal($input: SignDealInput!) {
       success
       message
       deal { id status }
+    }
+  }
+}
+"""
+
+_ACTIVATE_DEAL = """
+mutation ActivateDeal($input: ActivateDealInput!) {
+  dealFlow {
+    activateDeal(input: $input) {
+      success
+      message
+      deal { id status workflowId }
     }
   }
 }
@@ -171,6 +186,7 @@ class DealExecutor(BaseExecutor):
         dispatch = {
             "propose_deal": self._execute_propose_deal,
             "sign_deal": self._execute_sign_deal,
+            "activate_deal": self._execute_activate_deal,
             "set_automation_key": self._execute_set_automation_key,
             "set_loan_collect_key": self._execute_set_loan_collect_key,
             "revoke_loan_collect_key": self._execute_revoke_loan_collect_key,
@@ -204,7 +220,9 @@ class DealExecutor(BaseExecutor):
 
     def _execute_propose_deal(self, command: Command) -> CommandResponse:
         self.log_command_start(command)
-        token, err = self._acquire_token_or_error(command, use_delegation=False)
+        # A deal may be authored by a group. Honor an explicitly supplied
+        # `user.group`; with no group this remains the caller's self session.
+        token, err = self._acquire_token_or_error(command, use_delegation=True)
         if err:
             return err
 
@@ -278,8 +296,10 @@ class DealExecutor(BaseExecutor):
         return CommandResponse.success_response(command.name, command.type, outputs)
 
     # ------------------------------------------------------------------
-    # sign_deal — a counter-signing party signs; the last signer flips
-    # the deal to Active and seeds the deal_periods rows.
+    # sign_deal — a counter-signing party signs. Once every party has
+    # signed, the deal becomes Accepted. A counterparty's JWT is never
+    # reused to activate the proposer's workflow; the proposer follows
+    # with activate_deal.
     # ------------------------------------------------------------------
 
     def _execute_sign_deal(self, command: Command) -> CommandResponse:
@@ -306,7 +326,7 @@ class DealExecutor(BaseExecutor):
 
         deal = data.get("deal") or {}
         # GraphQL serialises DealStatus in SCREAMING form (DRAFT / PROPOSED /
-        # ACCEPTED / ACTIVE …) — assert against "ACTIVE", not "Active".
+        # ACCEPTED / ACTIVE …).
         outputs = {
             "deal_id": deal.get("id") or str(deal_id),
             "status": deal.get("status"),
@@ -315,6 +335,55 @@ class DealExecutor(BaseExecutor):
         self.store_outputs(command.name, outputs)
         self.logger.success(
             f"    ✅ sign_deal {outputs['deal_id']}: status={outputs['status']}"
+        )
+        self.log_command_success(command)
+        return CommandResponse.success_response(command.name, command.type, outputs)
+
+    # ------------------------------------------------------------------
+    # activate_deal — the proposer explicitly starts an Accepted deal's
+    # pipeline. If a group proposed the deal, the matching group delegation
+    # must be supplied here so DMS sees the same effective proposer entity.
+    # ------------------------------------------------------------------
+
+    def _execute_activate_deal(self, command: Command) -> CommandResponse:
+        self.log_command_start(command)
+        token, err = self._acquire_token_or_error(command, use_delegation=True)
+        if err:
+            return err
+
+        deal_id = command.parameters.get("deal_id")
+        if not deal_id:
+            return self._fail(command, "activate_deal requires `deal_id`")
+
+        self.log_parameters({"deal_id": deal_id})
+
+        response = self._graphql(
+            _ACTIVATE_DEAL,
+            {"input": {"dealId": str(deal_id)}},
+            token,
+        )
+        if not response.success:
+            return self._finalize_graphql_error(
+                command, response, operation_name="ActivateDeal"
+            )
+        data = response.get_data("dealFlow.activateDeal", {}) or {}
+        if not data.get("success"):
+            return self._finalize_business_error(
+                command,
+                data.get("message", "activateDeal not successful"),
+                operation_name="ActivateDeal",
+            )
+
+        deal = data.get("deal") or {}
+        outputs = {
+            "deal_id": deal.get("id") or str(deal_id),
+            "status": deal.get("status"),
+            "workflow_id": deal.get("workflowId"),
+            "message": data.get("message"),
+        }
+        self.store_outputs(command.name, outputs)
+        self.logger.success(
+            f"    ✅ activate_deal {outputs['deal_id']}: status={outputs['status']}"
         )
         self.log_command_success(command)
         return CommandResponse.success_response(command.name, command.type, outputs)
@@ -569,9 +638,9 @@ class DealExecutor(BaseExecutor):
 
     def _execute_execute_step(self, command: Command) -> CommandResponse:
         self.log_command_start(command)
-        # Execute AS the caller themselves (the assignee) — /execute signs under
-        # the caller's JWT and verifies they are the step's assignee.
-        token, err = self._acquire_token_or_error(command, use_delegation=False)
+        # Execute as the declared assignee. A self-assigned party omits group;
+        # a group-as-proposer step supplies user.group and uses its delegation.
+        token, err = self._acquire_token_or_error(command, use_delegation=True)
         if err:
             return err
 
@@ -583,6 +652,7 @@ class DealExecutor(BaseExecutor):
 
         interval = self._float_param(command, "wait_interval", 3.0)
         find_timeout = self._float_param(command, "find_timeout", 90.0)
+        wait_timeout = self._float_param(command, "wait_timeout", 300.0)
 
         # 1. The deferred step materialises a pending action carrying its
         #    pipeline coordinates (group_id + workflow_id) under `_pipeline`.
@@ -616,24 +686,32 @@ class DealExecutor(BaseExecutor):
             "workflow_id": workflow_id,
         })
 
-        # 2. Drive /execute. The HTTP RESPONSE is the reliable acceptance signal
-        #    (202 accepted / 200 done); a benign 4xx like "already"/"in progress"/
-        #    "cannot start from status" means a racing auto-exec or a prior call
-        #    already claimed it — idempotent, treat as accepted.
+        # 2. Drive /execute. Only a successful response is authoritative. A
+        #    precise 409 may mean another caller already claimed this step, but
+        #    it is safe to continue only when the workflow row will be polled.
+        should_wait = self._should_wait(command)
+        refresh_token = (
+            self.token_manager.refresh_token_for_access_token(token)
+            if self.token_manager
+            else None
+        )
         res = self.agents_service.execute_step(
-            token, group_id=str(group_id), workflow_id=str(workflow_id), step_key=str(step_id)
+            token,
+            group_id=str(group_id),
+            workflow_id=str(workflow_id),
+            step_key=str(step_id),
+            refresh_token=refresh_token,
         )
         if isinstance(res, dict) and res.get("status") == "error":
             msg = str(res.get("message") or "")
-            benign = any(
-                tok in msg.lower()
-                for tok in ("already", "in_progress", "in progress", "cannot start", "not ready")
-            )
-            if not benign:
+            if res.get("status_code") != 409 or not should_wait:
                 return self._finalize_business_error(
                     command, f"/execute failed: {msg}", operation_name="ExecuteStep"
                 )
-            self.logger.info(f"      /execute idempotent no-op: {msg[:120]}")
+            self.logger.info(
+                "      /execute returned 409; reconciling from the "
+                "authoritative workflow step"
+            )
 
         outputs = {
             "deal_id": deal_id,
@@ -642,13 +720,126 @@ class DealExecutor(BaseExecutor):
             "workflow_id": workflow_id,
             "execute_response": res,
         }
+
+        # 3. `/execute` only acknowledges that the asynchronous chain was
+        #    accepted. The workflow row is the authoritative outcome: wait for
+        #    THIS step to complete or fail so a background error cannot be
+        #    misreported as success and surface later as a missing-next-step
+        #    timeout. Explicit `wait: false` preserves fire-and-forget callers.
+        if should_wait:
+            self.logger.info(
+                f"  ⏳ awaiting workflow step '{step_id}' "
+                f"(interval={interval}s, timeout={wait_timeout}s)"
+            )
+            try:
+                poll = self.agents_service.poll_workflow_step(
+                    self._token_for_polling(
+                        command, token, use_delegation=True
+                    ),
+                    group_id=str(group_id),
+                    workflow_id=str(workflow_id),
+                    step_key=str(step_id),
+                    interval=interval,
+                    timeout=wait_timeout,
+                )
+            except TimeoutError as e:
+                outputs["wait_timed_out"] = True
+                outputs["wait_error"] = str(e)
+                return self._execute_step_failure(command, outputs, str(e))
+
+            observation = (
+                poll.observation if isinstance(poll.observation, dict) else {}
+            )
+            workflow = observation.get("workflow") or {}
+            step = observation.get("step") or {}
+            step_status = str(step.get("status") or "").lower()
+            workflow_status = str(workflow.get("status") or "").lower()
+            outputs.update(
+                {
+                    "step_status": step_status or None,
+                    "step_result": step.get("result"),
+                    "external_message_id": step.get("external_message_id"),
+                    "workflow_status": workflow_status or None,
+                    "wait_attempts": poll.attempts,
+                    "wait_elapsed": poll.elapsed,
+                    "wait_timed_out": False,
+                }
+            )
+
+            if step_status != "completed":
+                message = self._workflow_step_failure_message(
+                    str(step_id), step_status, step, workflow
+                )
+                return self._execute_step_failure(command, outputs, message)
+
+            self.logger.success(
+                f"    ✅ workflow step {step_id} completed in "
+                f"{poll.attempts} poll(s) / {poll.elapsed:.1f}s"
+            )
+
         self.store_outputs(command.name, outputs)
         self.logger.success(
-            f"    ✅ execute_step {step_id}: /execute accepted (group={group_id} "
-            f"workflow={workflow_id})"
+            f"    ✅ execute_step {step_id}: "
+            f"{'completed' if should_wait else '/execute accepted'} "
+            f"(group={group_id} workflow={workflow_id})"
         )
         self.log_command_success(command)
         return CommandResponse.success_response(command.name, command.type, outputs)
+
+    def _execute_step_failure(
+        self,
+        command: Command,
+        outputs: dict,
+        message: str,
+    ) -> CommandResponse:
+        """Return a failed execute_step while retaining its diagnostics."""
+        self.store_outputs(command.name, outputs)
+        self.logger.error(f"    ❌ ExecuteStep failed: {message}")
+        self.log_command_failure(command)
+        return CommandResponse(
+            success=False,
+            command_name=command.name,
+            command_type=command.type,
+            message="Command execution failed",
+            data=outputs,
+            errors=[message],
+        )
+
+    @staticmethod
+    def _workflow_step_failure_message(
+        step_id: str,
+        step_status: str,
+        step: dict,
+        workflow: dict,
+    ) -> str:
+        """Build a concise error from the terminal workflow observation."""
+        result = step.get("result")
+        detail = None
+        if isinstance(result, dict):
+            detail = (
+                result.get("error")
+                or result.get("reason")
+                or result.get("message")
+            )
+        elif result is not None:
+            detail = str(result)
+        detail = detail or workflow.get("result_summary")
+
+        status = step_status or "unknown"
+        workflow_status = str(workflow.get("status") or "").lower()
+        if status not in {"failed", "rejected", "cancelled", "skipped"}:
+            message = (
+                f"workflow reached terminal status {workflow_status or 'unknown'} "
+                f"while step '{step_id}' remained {status}"
+            )
+            if detail:
+                message += f": {detail}"
+            return message
+
+        message = f"workflow step '{step_id}' reached terminal status {status}"
+        if detail:
+            message += f": {detail}"
+        return message
 
     def _await_pending_action(
         self,
@@ -672,11 +863,16 @@ class DealExecutor(BaseExecutor):
             )
             if response.success:
                 actions = response.get_data("dealFlow.pendingActionsForDeal", []) or []
+                if not isinstance(actions, list):
+                    actions = []
                 match = next(
                     (
                         a
-                        for a in actions
+                        for a in reversed(actions)
+                        if isinstance(a, dict)
                         if str(a.get("stepId")) == step_id
+                        and str(a.get("status") or "").upper()
+                        in {"PENDING", "IN_PROGRESS"}
                         and isinstance(a.get("descriptorInputs"), dict)
                         and isinstance(
                             a["descriptorInputs"].get("_pipeline"), dict

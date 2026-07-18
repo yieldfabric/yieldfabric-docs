@@ -6,10 +6,8 @@
 # sister routes) was removed in commit c3119db. This script runs the
 # replacement path: build a `DealPlan` containing a
 # `create_composed_contract` action (and optional `create_swap` follow-on),
-# then drive it through `proposeDeal` → counterparty `signDeal`
-# (auto-activates when no more signers remain; falls back to an
-# explicit `activateDeal` if it doesn't), and poll `dealById` until
-# terminal.
+# then drive it through `proposeDeal` → counterparty `signDeal` →
+# proposer `activateDeal`, and poll `dealById` until terminal.
 #
 # Auth on port 3000, agents GraphQL on port 3001 (env-overridable).
 
@@ -174,13 +172,9 @@ propose_deal() {
 
 sign_deal() {
     local jwt=$1; local deal_id=$2
-    # The deal-flow auto-activates when the counterparty's signature is
-    # the last one required (no remaining signers). In that case the
-    # returned deal carries `status=ACTIVE` and a populated `workflowId`
-    # — the proposer's separate `activateDeal` call becomes redundant.
-    # Include `workflowId` in the selection so the test can pick up the
-    # spawned workflow id from either path (auto-activate here OR the
-    # explicit `activateDeal` below).
+    # A counterparty signature completes acceptance but never reuses the
+    # counterparty JWT to launch the proposer's workflow. The deal must be
+    # ACCEPTED here; the proposer activates it explicitly below.
     local query='mutation Sign($input: SignDealInput!) {
         dealFlow {
             signDeal(input: $input) {
@@ -598,43 +592,25 @@ main() {
     echo "$sign_resp" | jq '.' | sed 's/^/  /'
     local sign_status
     sign_status=$(echo "$sign_resp" | jq -r '.data.dealFlow.signDeal.deal.status // empty')
-    # Two acceptable post-signDeal states:
-    #   ACTIVE   — the new auto-activate path: when the counterparty's
-    #              signature is the last one required, signDeal compiles
-    #              the plan + spawns the workflow inline. The proposer's
-    #              separate `activateDeal` call is redundant in this path
-    #              and is skipped below.
-    #   ACCEPTED — the legacy two-step path (or the fallback when
-    #              auto-activate failed; the deal stays ACCEPTED so the
-    #              proposer can retry `activateDeal` explicitly).
-    if [[ "$sign_status" != "ACCEPTED" && "$sign_status" != "ACTIVE" ]]; then
-        echo_with_color "$RED" "❌ signDeal left the deal in an unexpected status (got: $sign_status — expected ACCEPTED or ACTIVE)"; exit 1
+    if [[ "$sign_status" != "ACCEPTED" ]]; then
+        echo_with_color "$RED" "❌ signDeal left the deal in an unexpected status (got: $sign_status — expected ACCEPTED)"; exit 1
     fi
     echo_with_color "$GREEN" "  ✅ Deal signed → $sign_status"
     echo ""
 
-    local workflow_id
-    if [[ "$sign_status" == "ACTIVE" ]]; then
-        # Auto-activate path: workflow already spawned inline. Pick up
-        # the workflowId from signDeal's response so the rest of the
-        # test (polling, etc.) sees it without an extra call.
-        workflow_id=$(echo "$sign_resp" | jq -r '.data.dealFlow.signDeal.deal.workflowId // empty')
-        if [[ -z "$workflow_id" ]]; then
-            echo_with_color "$YELLOW" "  ⚠️  signDeal auto-activated but returned no workflowId — pipeline runtime may not have spawned a workflow"
-        else
-            echo_with_color "$GREEN" "  ✅ Auto-activated · workflow spawned: $workflow_id"
-        fi
+    echo_with_color "$CYAN" "🚀 Activating deal as proposer..."
+    local activate_resp activate_status workflow_id
+    activate_resp=$(activate_deal "$proposer_jwt" "$deal_id")
+    echo "$activate_resp" | jq '.' | sed 's/^/  /'
+    activate_status=$(echo "$activate_resp" | jq -r '.data.dealFlow.activateDeal.deal.status // empty')
+    if [[ "$activate_status" != "ACTIVE" ]]; then
+        echo_with_color "$RED" "❌ activateDeal left the deal in an unexpected status (got: $activate_status — expected ACTIVE)"; exit 1
+    fi
+    workflow_id=$(echo "$activate_resp" | jq -r '.data.dealFlow.activateDeal.deal.workflowId // empty')
+    if [[ -z "$workflow_id" ]]; then
+        echo_with_color "$YELLOW" "  ⚠️  activateDeal returned no workflowId — pipeline runtime may not have spawned a workflow"
     else
-        echo_with_color "$CYAN" "🚀 Activating deal..."
-        local activate_resp
-        activate_resp=$(activate_deal "$proposer_jwt" "$deal_id")
-        echo "$activate_resp" | jq '.' | sed 's/^/  /'
-        workflow_id=$(echo "$activate_resp" | jq -r '.data.dealFlow.activateDeal.deal.workflowId // empty')
-        if [[ -z "$workflow_id" ]]; then
-            echo_with_color "$YELLOW" "  ⚠️  activateDeal returned no workflowId — pipeline runtime may not have spawned a workflow"
-        else
-            echo_with_color "$GREEN" "  ✅ Workflow spawned: $workflow_id"
-        fi
+        echo_with_color "$GREEN" "  ✅ Deal activated · workflow spawned: $workflow_id"
     fi
     echo ""
 

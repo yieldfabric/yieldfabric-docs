@@ -51,6 +51,8 @@ Environment Variables (also read from ./.env, or --env-file):
   AUTH_SERVICE_URL    Auth service URL    (default: http://localhost:3000)
   AGENTS_SERVICE_URL  Agents service URL  (default: http://localhost:3001) —
                       hosts the deal-flow GraphQL used by deal-lifecycle commands
+  CHAIN_ID             Pin login/API-key sessions to this chain. Required when
+                       PAY_SERVICE_URL targets a non-default payments instance.
   COMMAND_DELAY       Delay between commands in seconds (default: 0)
   DEBUG               Enable debug logging (default: false)
         """,
@@ -83,6 +85,10 @@ Environment Variables (also read from ./.env, or --env-file):
     parser.add_argument(
         "--agents-service-url",
         help="override agents service URL (deal-flow GraphQL; default :3001)",
+    )
+    parser.add_argument(
+        "--chain-id",
+        help="pin CLI auth sessions to this chain (overrides CHAIN_ID env)",
     )
     parser.add_argument(
         "--api-key",
@@ -140,6 +146,8 @@ def _apply_overrides(config: YieldFabricConfig, args: argparse.Namespace):
         config.auth_service_url = args.auth_service_url
     if args.agents_service_url:
         config.agents_service_url = args.agents_service_url
+    if args.chain_id:
+        config.chain_id = args.chain_id.strip()
     if args.command_delay:
         config.command_delay = args.command_delay
     if args.api_key:

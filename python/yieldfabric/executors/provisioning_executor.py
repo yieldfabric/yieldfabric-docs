@@ -2,24 +2,25 @@
 Provisioning + claims executor.
 
 Adds the *creation* + *compliance* command types the swap/payment suites
-never needed — account/group deploy, ERC-3643 token + obligation-class
+never needed — account/group activation, ERC-3643 token + obligation-class
 deploy, claim-requirement (CTR/TIR) configuration, and the full claims
 lifecycle (issue → accept → revoke → re-issue) plus the `is_verified`
 gating read.
 
 Why a dedicated executor: these hit a mix of surfaces the other
 executors don't —
-  * auth REST (`:3000`)              — group create + account deploy,
+  * auth REST (`:3000`)              — group create + explicit chain-account activation,
   * asset-register REST (`:3002`)    — token deploy, is_verified,
                                        claim_requirements, register_identity,
                                        update_claim_requirements,
   * claims-management REST (`:3002`) — issue/accept/decline/revoke/reissue,
   * payments GraphQL (`:3002`)       — deploy_obligation (class).
 
-All of them are delegation-aware: `user.group` makes `get_token()` mint a
-delegation JWT whose `acting_as` is the group, so a group delegate creates/
-issues/manages as the group (the claims handlers key authorization off
-`context_entity_id() = acting_as ?? sub`).
+Chain writes are delegation-aware: `user.group` makes `get_token()` mint a
+delegation JWT whose `acting_as` is the group, so a group delegate issues/
+manages as the group (the claims handlers key authorization off
+`context_entity_id() = acting_as ?? sub`). Group creation/activation is the
+intentional exception and uses the human Owner/Admin's personal credential.
 
 NOTE (live-verification): authored against the handlers (asset-register
 `router.rs`, claims `flows.rs`, auth routes) — exact field names verified
@@ -33,7 +34,7 @@ from typing import Optional
 from urllib.parse import urlencode
 
 from ..models import Command, CommandResponse
-from ..utils.jwt import get_sub
+from ..utils.jwt import extract_claim, get_sub
 from .base import BaseExecutor
 
 
@@ -66,7 +67,16 @@ class ProvisioningExecutor(BaseExecutor):
             return CommandResponse.error_response(
                 command.name, command.type, [f"Unsupported type: {command.type}"]
             )
-        token, err = self._acquire_token_or_error(command)
+        # Creating/activating a group is authorized by its human Owner/Admin.
+        # A delegation JWT cannot exist before that group's first account and
+        # must never be used to activate a different target group.
+        personal_account_command = command.type.lower() in (
+            "create_group",
+            "deploy_account",
+        )
+        token, err = self._acquire_token_or_error(
+            command, use_delegation=not personal_account_command
+        )
         if err:
             return err
         try:
@@ -107,21 +117,6 @@ class ProvisioningExecutor(BaseExecutor):
             token=token, description=path, default={"status": "error", "error": "no response"},
         )
 
-    @staticmethod
-    def _wallet_id_for_address(account_address, explicit=None):
-        """Canonical wallet id for an on-chain account: `WLT-<lowercased address>`.
-
-        The `/auth/groups/{id}/account-status` payload carries `account_address`
-        but NO `wallet_id`, so derive it — wallet rows and JWT `default_wallet_id`
-        claims use the `WLT-<lowercase 0x…>` form. An explicit value (if a future
-        endpoint provides one) wins.
-        """
-        if explicit:
-            return explicit
-        if account_address:
-            return f"WLT-{str(account_address).lower()}"
-        return None
-
     def _finish(self, command: Command, ok: bool, outputs: dict, body, op: str) -> CommandResponse:
         if ok:
             self.store_outputs(command.name, outputs)
@@ -141,7 +136,7 @@ class ProvisioningExecutor(BaseExecutor):
     # ------------------------------------------------------------------
 
     def _create_group(self, command: Command, token: str) -> CommandResponse:
-        """Create a group (as the caller) + deploy its on-chain account.
+        """Create a group and explicitly activate its selected-chain account.
 
         Idempotent: an existing group is recovered by name. Mirrors the
         proven setup_runner group-bootstrap path.
@@ -158,79 +153,80 @@ class ProvisioningExecutor(BaseExecutor):
         if status not in ("created", "exists") or not group_id:
             return self._finish(command, False, {}, res, "create_group")
 
-        # Deploy the on-chain account if needed, polling status to `deployed`.
-        acct_status = self.auth_service.group_account_status(token, group_id)
-        if acct_status == "not_deployed":
-            dep = self.auth_service.deploy_group_account(token, group_id)
-            if dep.get("status") != "success":
-                return self._finish(command, False, {}, dep, "deploy_group_account")
-            from ..utils.polling import poll_until
-            try:
-                poll_until(
-                    lambda: self.auth_service.group_account_status(token, group_id),
-                    lambda s: s == "deployed",
-                    interval=1.0, timeout=120.0,
-                    description=f"group {name} account deploy",
-                )
-            except TimeoutError as e:
-                return self._finish(command, False, {}, {"error": str(e)}, "deploy_group_account")
-
-        info = self.auth_service.group_account_info(token, group_id) or {}
-        account_address = info.get("account_address")
+        chain_id = self._p(command, "chain_id") or extract_claim(
+            token, "default_chain_id"
+        )
+        if not chain_id:
+            return CommandResponse.error_response(
+                command.name,
+                command.type,
+                ["could not resolve chain_id from creator JWT"],
+            )
+        activation = self.auth_service.wait_for_chain_account_activation(
+            token,
+            "group",
+            group_id,
+            str(chain_id),
+            attempts=60,
+            interval=2.0,
+        )
+        if activation.get("status") != "ready":
+            return self._finish(
+                command, False, {}, activation, "activate_group_account"
+            )
         outputs = {
             "group_id": group_id,
-            "account_address": account_address,
-            "wallet_id": self._wallet_id_for_address(account_address, info.get("wallet_id")),
+            "chain_id": activation.get("chain_id") or str(chain_id),
+            "account_address": activation.get("account_address"),
+            "wallet_id": activation.get("wallet_id"),
             "created": status == "created",
         }
         return self._finish(command, True, outputs, res, "create_group")
 
     def _deploy_account(self, command: Command, token: str) -> CommandResponse:
-        """Deploy (or ensure) the CALLER's confidential account.
+        """Explicitly activate the CALLER's account on the selected chain.
 
-        For a user JWT this targets `/auth/users/{sub}/deploy-account`. For
-        a group delegation JWT, the group account is provisioned via
-        `create_group`; here we just confirm it via whoami-style status and
-        return its address.
+        Both user and group targets use the canonical per-chain activation
+        resource. Group activation deliberately uses the human caller's
+        personal Owner/Admin credential, acquired by `execute` above.
         """
-        # Group delegation: the account is the group account; surface it.
+        entity_kind = "user"
+        entity_id = self._p(command, "user_id") or get_sub(token)
         if command.user.group:
-            group_id = self.auth_service.get_group_id_by_name(
-                self.auth_service.login(command.user.id, command.user.password), command.user.group
+            entity_kind = "group"
+            entity_id = self.auth_service.get_group_id_by_name(
+                token, command.user.group
             )
-            if group_id:
-                self.auth_service.deploy_group_account(token, group_id)
-                from ..utils.polling import poll_until
-                try:
-                    poll_until(
-                        lambda: self.auth_service.group_account_status(token, group_id),
-                        lambda s: s == "deployed",
-                        interval=1.0, timeout=120.0, description="group account deploy",
-                    )
-                except TimeoutError:
-                    pass
-                info = self.auth_service.group_account_info(token, group_id) or {}
-                acct = info.get("account_address")
-                return self._finish(
-                    command, bool(acct),
-                    {"account_address": acct,
-                     "wallet_id": self._wallet_id_for_address(acct, info.get("wallet_id"))},
-                    info, "deploy_account(group)",
-                )
-
-        user_id = self._p(command, "user_id") or get_sub(token)
-        if not user_id:
+        if not entity_id:
             return CommandResponse.error_response(
-                command.name, command.type, ["could not resolve user_id from JWT"]
+                command.name,
+                command.type,
+                [f"could not resolve {entity_kind}_id"],
             )
-        body = self.auth_service._post_json_safe(
-            f"/auth/users/{user_id}/deploy-account", {}, token=token, description="deploy_account",
+        chain_id = self._p(command, "chain_id") or extract_claim(token, "default_chain_id")
+        if not chain_id:
+            return CommandResponse.error_response(
+                command.name, command.type, ["could not resolve chain_id from JWT"]
+            )
+
+        body = self.auth_service.wait_for_chain_account_activation(
+            token,
+            entity_kind,
+            entity_id,
+            str(chain_id),
+            attempts=60,
+            interval=2.0,
         )
-        # `{status: success|error, message}` — treat success or an
-        # already-deployed message as ok (idempotent).
-        ok = isinstance(body, dict) and str(body.get("status", "")).lower() in ("success", "ok", "deployed")
-        already = "already" in self._rest_err(body).lower() or "deployed" in self._rest_err(body).lower()
-        return self._finish(command, ok or already, {"user_id": user_id, "message": (body or {}).get("message")}, body, "deploy_account")
+
+        ok = body.get("status") == "ready" and bool(body.get("account_address"))
+        outputs = {
+            f"{entity_kind}_id": entity_id,
+            "chain_id": body.get("chain_id") or str(chain_id),
+            "wallet_id": body.get("wallet_id"),
+            "account_address": body.get("account_address"),
+            "deployed": body.get("deployed"),
+        }
+        return self._finish(command, ok, outputs, body, "deploy_account")
 
     # ------------------------------------------------------------------
     # token + obligation-class deploy

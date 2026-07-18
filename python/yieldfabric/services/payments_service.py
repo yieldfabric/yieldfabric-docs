@@ -381,22 +381,50 @@ class PaymentsService(BaseServiceClient):
             return None
 
     def submit_signed_message(
-        self, user_id: str, message_id: str, signature_hex: str, token: str
+        self,
+        user_id: str,
+        message_id: str,
+        signature_hex: str,
+        unsigned_transaction_id: str,
+        token: str,
     ) -> dict:
         """
         POST /api/users/{user_id}/messages/{message_id}/submit-signed-message.
-        Hands a locally-produced signature back to the backend.
+        Hands a locally-produced signature back to the backend, bound to the
+        exact unsigned-transaction generation returned by the GET endpoint.
         """
         try:
             response = self._post(
                 f"/api/users/{user_id}/messages/{message_id}/submit-signed-message",
-                data={"signature": signature_hex},
+                data={
+                    "signature": signature_hex,
+                    "unsigned_transaction_id": unsigned_transaction_id,
+                },
                 token=token,
             )
             return response.json()
         except Exception as e:
             self.logger.error(f"submit_signed_message failed: {e}")
             return {"status": "error", "message": str(e)}
+
+    def retry_message(
+        self,
+        user_id: str,
+        message_id: str,
+        execution_mode: str,
+        token: str,
+    ) -> dict:
+        """Redrive one failed canonical payment Retrieve message in place."""
+        try:
+            response = self._post(
+                f"/api/users/{user_id}/messages/{message_id}/retry",
+                data={"execution_mode": execution_mode},
+                token=token,
+            )
+            return response.json()
+        except Exception as e:
+            self.logger.error(f"retry_message failed: {e}")
+            return {"success": False, "message": str(e)}
 
     def get_messages_awaiting_signature(self, user_id: str, token: str) -> List[dict]:
         """
@@ -600,22 +628,45 @@ class PaymentsService(BaseServiceClient):
                 return True
 
             status = str(response.get("status") or "").lower()
-            if status in {"failed", "error", "canceled"}:
-                return True
-            if response.get("success") is False or response.get("error"):
-                return True
             if status == "post_processing":
                 return False
 
-            has_post_lifecycle = (
-                "post_processed_at" in response
-                or "post_processing_attempts" in response
-                or "post_processing_error_kind" in response
+            # The current message-status endpoint adds the post-processing
+            # lifecycle at the top level of the QueueMessage payload. Accept
+            # the older nested shape too so mixed-version local environments
+            # remain observable while services are restarted independently.
+            post_processed_at = (
+                obs.get("post_processed_at")
+                or response.get("post_processed_at")
             )
+            has_post_lifecycle = any(
+                key in source
+                for source in (obs, response)
+                for key in (
+                    "post_processed_at",
+                    "post_processing_attempts",
+                    "post_processing_error_kind",
+                )
+            )
+
+            # A failed/error/canceled chain result is not settled until its
+            # failure handler has cleared/reconciled context and projected the
+            # physical ledger fact. Returning at `executed` lets a same-message
+            # redrive race that work and discard the failed attempt's graph
+            # event. Fail closed when the lifecycle lookup is temporarily
+            # absent: a later probe will observe the canonical marker.
+            terminal_failure = (
+                status in {"failed", "error", "canceled"}
+                or response.get("success") is False
+                or bool(response.get("error"))
+            )
+            if terminal_failure:
+                return bool(post_processed_at)
+
             if not has_post_lifecycle:
                 return True
 
-            return bool(response.get("post_processed_at"))
+            return bool(post_processed_at)
 
         return poll_until(
             _probe,
@@ -679,8 +730,9 @@ class PaymentsService(BaseServiceClient):
         the first iteration that returns `acceptedCount > 0` wins; we
         do NOT keep polling for additional accepts after that.
 
-        Returns the final acceptAll response. Raises TimeoutError if
-        no payments ever materialize for acceptance in `timeout` seconds.
+        Returns the final acceptAll response, including every accepted
+        payment's durable MQ message id. Raises TimeoutError if no payments
+        ever materialize for acceptance in `timeout` seconds.
 
         This is how loan_management / payment workflows avoid the race
         where `accept_all` is called before MQ has persisted the
@@ -695,6 +747,17 @@ class PaymentsService(BaseServiceClient):
                 acceptedCount
                 failedCount
                 message
+                acceptedPayments {
+                    paymentId
+                    amount
+                    messageId
+                    transactionId
+                }
+                failedPayments {
+                    paymentId
+                    amount
+                    error
+                }
             }
         }
         """

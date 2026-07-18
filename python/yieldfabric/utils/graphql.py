@@ -54,11 +54,13 @@ class GraphQLMutation:
     mutation Accept($input: AcceptInput!) {
         accept(input: $input) {
             success
+            disposition
             message
             accountAddress
             idHash
             acceptResult
             messageId
+            transactionId
             timestamp
         }
     }

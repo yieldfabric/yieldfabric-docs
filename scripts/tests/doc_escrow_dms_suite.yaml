@@ -1,5 +1,5 @@
 # ════════════════════════════════════════════════════════════════════════════
-#  DOCUMENT ESCROW — THROUGH THE DMS DEAL FLOW (propose → sign → execute_step)
+#  DOCUMENT ESCROW — DMS FLOW (propose → sign → activate → execute_step)
 # ════════════════════════════════════════════════════════════════════════════
 #
 #  The DMS counterpart to doc_escrow_suite.yaml. That suite drives the SUBSTRATE
@@ -19,9 +19,10 @@
 #  MODEL (three deal parties; the doc-gated release driven through the DAG):
 #    G          = the ESCROW account — the payer's pre-existing group ("Issuer
 #                 Group"), FUNDED OUT-OF-BAND below (see WHY PRE-FUNDED).
-#    payer      = issuer (deal PROPOSER; owns G; registers the release policy —
-#                 and, being the registrar AND sole required signer, the policy
-#                 is auto-approved at registration, so there is NO approve step).
+#    payer      = Issuer Group (deal PROPOSER and owner of G). The issuer acts
+#                 under group delegation to register the release policy; its own
+#                 wallet is the sole required signer, so registration also
+#                 auto-approves the policy (there is NO approve step).
 #    beneficiary= collateral (deal party; the policy EXECUTOR; releases G→self).
 #    attestor   = investor (deal party; NEUTRAL certifier; commits the ZK
 #                 document at ITS OWN oracle slot — the requirement's `obligor`).
@@ -54,10 +55,9 @@
 #        a step auto-advances instead, its execute_step finds no pending action
 #        and times out — that is the signal to drop it.
 #    (B) RELEASE EXECUTOR CONTEXT. The beneficiary executes release_escrow as
-#        itself; the on-chain executor gate checks msg.sender against the policy's
-#        executor_accounts (the beneficiary's wallet), so no group context should
-#        be needed. If the gate requires it, run that execute_step with
-#        `group: Issuer Group`.
+#        itself because it is the step assignee and policy executor. The sealed
+#        `acting_as_group` input supplies the escrow-account context to the
+#        bridge; changing the caller JWT to the group would fail assignee gating.
 #    (C) SETTLE WAITS. commit must be persisted shared-at-rest before register
 #        derives the constraint from it; the release send must settle before the
 #        beneficiary accepts. The sleeps below are sized from the command-suite's
@@ -109,7 +109,7 @@ commands:
   # account_address points at the pre-existing (pre-funded) Issuer Group.
   - name: propose_escrow
     type: propose_deal
-    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
     parameters:
       name: "Document Escrow (DMS) $(cat /tmp/yf_docesc_dms_nonce)"
       parties:
@@ -191,9 +191,11 @@ commands:
       actual: "$propose_escrow.deal_id"
       contains: "DEAL"
 
-  # ═══════════════ 2 — BOTH COUNTERPARTIES SIGN → ACTIVATE ═══════════════
+  # ═══════════════ 2 — COUNTERPARTIES SIGN, THEN PROPOSER ACTIVATES ═══════════════
   # The proposer (payer) auto-signs at propose. The beneficiary + attestor each
-  # sign; the LAST signer flips the deal Proposed → Active and starts the DAG.
+  # sign, moving the deal Proposed → Accepted. Issuer Group is the proposer
+  # because the plan operates on its account; its delegated session then
+  # activates the Accepted deal and starts the DAG.
   - name: beneficiary_sign
     type: sign_deal
     user: { id: collateral@yieldfabric.com, password: collateral_password }
@@ -204,11 +206,23 @@ commands:
     user: { id: investor@yieldfabric.com, password: investor_password }
     parameters: { deal_id: $propose_escrow.deal_id }
 
-  - name: assert_deal_active
+  - name: assert_deal_accepted
     type: assert
     user: { id: investor@yieldfabric.com, password: investor_password }
     parameters:
       actual: "$attestor_sign.status"
+      equals: "ACCEPTED"
+
+  - name: activate_escrow
+    type: activate_deal
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { deal_id: $propose_escrow.deal_id }
+
+  - name: assert_deal_active
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters:
+      actual: "$activate_escrow.status"
       equals: "ACTIVE"
 
   # ═══════════════ 3 — DRIVE THE DAG STEPS (caveat A) ═══════════════
@@ -231,7 +245,7 @@ commands:
   # Step 2: the PAYER registers the release policy (auto-approves at registration).
   - name: payer_execute_register
     type: execute_step
-    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
     parameters:
       deal_id: $propose_escrow.deal_id
       step_id: register_release_policy
@@ -267,10 +281,16 @@ commands:
     parameters: { seconds: 15 }
 
   # ───────── BENEFICIARY ACCEPTS the released payment + settle ─────────
+  # execute_step returns when the asynchronous release starts, before its payable
+  # is necessarily projected. Poll acceptAll until that payable is present instead
+  # of using accept_all's ineffective `wait: true` (it returns no message_id).
   - name: beneficiary_accept
-    type: accept_all
+    type: wait_for_accept_all
     user: { id: collateral@yieldfabric.com, password: collateral_password }
-    parameters: { denomination: aud-token-asset, wait: true }
+    parameters:
+      denomination: aud-token-asset
+      idempotency_key: docesc-dms-accept-$(cat /tmp/yf_docesc_dms_nonce)
+      timeout: 120
   - name: beneficiary_settle
     type: sleep
     user: { id: collateral@yieldfabric.com, password: collateral_password }

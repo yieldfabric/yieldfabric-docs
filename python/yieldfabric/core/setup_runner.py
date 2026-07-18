@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Optional
 from ..config import YieldFabricConfig
 from ..services import AuthService, PaymentsService
 from ..validation import ServiceValidator
-from ..utils.jwt import get_sub
+from ..utils.jwt import extract_claim, get_sub
 from ..utils.logger import get_logger
 
 try:
@@ -54,10 +54,11 @@ class YieldFabricSetupRunner:
     4. For each group:
          a. Login as the group's `user` (creator).
          b. Create the group (409 = exists, skip).
-         c. Deploy on-chain group account if status is not_deployed.
-         d. Add any declared members via an admin token.
-    5. Create tokens under an admin JWT.
-    6. Create assets under an admin JWT.
+         c. Explicitly activate its account on the creator JWT's chain.
+         d. Add any declared members via the creator's owner credential.
+    5. If wallet-bound sections exist, lazily activate the provisioning
+       principal and refresh its JWT wallet snapshot.
+    6. Create tokens and assets under that refreshed admin JWT.
     7. Create fiat accounts (US/UK/AU) if the section exists.
 
     Each step is also runnable on its own via :meth:`run_phases`, which
@@ -101,7 +102,13 @@ class YieldFabricSetupRunner:
         # re-create users, or re-acquire the admin token for each phase.
         self._services_ok: Optional[bool] = None
         self._users_ensured: bool = False
-        self._admin_token: Optional[str] = None
+        self._admin_session: Optional[Dict[str, Any]] = None
+        # Record the exact credential source that succeeded. Refresh tokens are
+        # preferred, but this lets us re-authenticate the same principal if an
+        # older auth deployment omits one; we must never activate one user and
+        # silently fall through to a different admin afterward.
+        self._admin_auth_source: Optional[Dict[str, str]] = None
+        self._admin_account_failed: bool = False
 
     # ------------------------------------------------------------------
 
@@ -162,6 +169,11 @@ class YieldFabricSetupRunner:
 
         self.logger.cyan(f"📄 Config file: {setup_file}")
         self.logger.cyan(f"▶  Phases: {', '.join(normalized)}")
+        if self.config.chain_id:
+            self.logger.cyan(
+                f"⛓️  Target chain: {self.config.chain_id} "
+                f"(payments: {self.config.pay_service_url})"
+            )
         self.logger.separator()
 
         all_ok = True
@@ -206,6 +218,19 @@ class YieldFabricSetupRunner:
             self.logger.error("❌ Could not acquire an admin token; aborting phase")
             return False
 
+        wallet_items = {
+            "tokens": setup.get("tokens") or [],
+            "assets": setup.get("assets") or [],
+            "fiat": setup.get("fiat_accounts") or [],
+        }
+        if phase in wallet_items and wallet_items[phase]:
+            admin_token = self._ensure_admin_chain_account(setup)
+            if not admin_token:
+                self.logger.error(
+                    f"❌ Skipping {phase}: provisioning account is not ready"
+                )
+                return False
+
         if phase == "groups":
             return self._setup_groups(setup.get("groups") or [], admin_token)
         if phase == "owners":
@@ -247,7 +272,7 @@ class YieldFabricSetupRunner:
         all_ok &= self._setup_users(setup.get("users") or [], admin_token)
         self._users_ensured = True
 
-        # 2. Groups (create + per-creator login + deploy + members).
+        # 2. Groups (create + per-creator login + explicit activation + members).
         self.logger.subsection("🏢 Groups")
         all_ok &= self._setup_groups(setup.get("groups") or [], admin_token)
 
@@ -259,19 +284,44 @@ class YieldFabricSetupRunner:
             self.logger.subsection("🔗 Group owners")
             all_ok &= self._setup_owners(groups, admin_token)
 
+        tokens = setup.get("tokens") or []
+        assets = setup.get("assets") or []
+        fiat_accounts = setup.get("fiat_accounts") or []
+        wallet_admin_token: Optional[str] = admin_token
+        if tokens or assets or fiat_accounts:
+            wallet_admin_token = self._ensure_admin_chain_account(setup)
+            if not wallet_admin_token:
+                all_ok = False
+
         # 3. Tokens.
         self.logger.subsection("🪙 Tokens")
-        all_ok &= self._setup_tokens(setup.get("tokens") or [], admin_token)
+        if tokens and not wallet_admin_token:
+            self.logger.error(
+                "  ❌ skipped: provisioning account is not ready"
+            )
+        else:
+            all_ok &= self._setup_tokens(tokens, wallet_admin_token or admin_token)
 
         # 4. Assets.
         self.logger.subsection("💎 Assets")
-        all_ok &= self._setup_assets(setup.get("assets") or [], admin_token)
+        if assets and not wallet_admin_token:
+            self.logger.error(
+                "  ❌ skipped: provisioning account is not ready"
+            )
+        else:
+            all_ok &= self._setup_assets(assets, wallet_admin_token or admin_token)
 
         # 5. Fiat accounts (optional — section may be commented out).
-        fiat_accounts = setup.get("fiat_accounts") or []
         if fiat_accounts:
             self.logger.subsection("🏦 Fiat accounts")
-            all_ok &= self._setup_fiat_accounts(fiat_accounts, admin_token)
+            if not wallet_admin_token:
+                self.logger.error(
+                    "  ❌ skipped: provisioning account is not ready"
+                )
+            else:
+                all_ok &= self._setup_fiat_accounts(
+                    fiat_accounts, wallet_admin_token
+                )
 
         self.logger.separator()
         if all_ok:
@@ -300,10 +350,165 @@ class YieldFabricSetupRunner:
             self._users_ensured = True
 
     def _ensure_admin(self, setup: Dict[str, Any]) -> Optional[str]:
-        """Acquire and cache the admin JWT (API key, else first user)."""
-        if self._admin_token is None:
-            self._admin_token = self._acquire_admin_token(setup.get("users") or [])
-        return self._admin_token
+        """Acquire and cache the admin token bundle (API key or password)."""
+        if self._admin_session is None:
+            self._admin_session = self._acquire_admin_session(
+                setup.get("users") or []
+            )
+        if not self._admin_session:
+            return None
+        token = self._admin_session.get("access_token")
+        return token if isinstance(token, str) and token else None
+
+    def _renew_admin_session(self, chain_id: str) -> Optional[Dict[str, Any]]:
+        """Refresh the same provisioning principal after lazy activation."""
+        session = self._admin_session or {}
+        refresh_token = session.get("refresh_token")
+        if isinstance(refresh_token, str) and refresh_token:
+            refreshed = self.auth_service.refresh_access_token(
+                refresh_token, chain_id=chain_id
+            )
+            if refreshed:
+                return refreshed
+            self.logger.warning(
+                "  ⚠️  Provisioning refresh token was unavailable; "
+                "re-authenticating the same principal"
+            )
+
+        # Compatibility fallback for an older response without a refresh token
+        # or a token rotated by another session. Re-present only the credential
+        # source that originally won; do not run the preference/fallback chain
+        # and risk switching users.
+        source = self._admin_auth_source or {}
+        if source.get("kind") == "api_key":
+            return self.auth_service.authenticate_api_key_session(
+                source.get("api_key", "")
+            )
+        if source.get("kind") == "password":
+            return self.auth_service.login_session(
+                source.get("email", ""), source.get("password", "")
+            )
+        return None
+
+    def _ensure_admin_chain_account(
+        self, setup: Dict[str, Any]
+    ) -> Optional[str]:
+        """Lazily activate and refresh the wallet-bound setup principal.
+
+        Token, asset, and fiat registration create auditable transaction
+        records signed by the effective JWT account. Login/API-key exchange
+        only selects a chain; it intentionally does not deploy an account.
+        This preflight performs that activation exactly when a wallet-bound
+        setup phase is about to run, then refreshes the JWT because wallet
+        claims are immutable snapshots.
+        """
+        if self._admin_account_failed:
+            return None
+
+        token = self._ensure_admin(setup)
+        if not token:
+            self._admin_account_failed = True
+            self.logger.error(
+                "❌ Cannot activate provisioning account: admin session unavailable"
+            )
+            return None
+
+        entity_id = get_sub(token)
+        token_chain = extract_claim(
+            token, "default_chain_id", "chain_id", "chainId"
+        )
+        chain_id = self.config.chain_id or (
+            str(token_chain) if token_chain is not None else None
+        )
+        if not entity_id or entity_id.startswith("service:"):
+            self._admin_account_failed = True
+            self.logger.error(
+                "❌ Provisioning credential did not resolve to an activatable user"
+            )
+            return None
+        if not chain_id or str(token_chain or "") != str(chain_id):
+            self._admin_account_failed = True
+            self.logger.error(
+                "❌ Provisioning JWT is not pinned to the configured target chain"
+            )
+            return None
+
+        account_address = extract_claim(token, "account_address")
+        wallet_id = extract_claim(token, "default_wallet_id")
+        if (
+            isinstance(account_address, str)
+            and account_address
+            and account_address.lower() != self._ZERO_ADDRESS
+            and isinstance(wallet_id, str)
+            and wallet_id
+        ):
+            return token
+
+        self.logger.info(
+            f"  🏦 Activating provisioning principal on chain {chain_id}"
+        )
+        activation = self.auth_service.wait_for_chain_account_activation(
+            token,
+            "user",
+            entity_id,
+            str(chain_id),
+            attempts=self._ACCT_POLL_ATTEMPTS,
+            interval=self._ACCT_POLL_INTERVAL,
+        )
+        if activation.get("status") != "ready":
+            self._admin_account_failed = True
+            detail = activation.get("error") or repr(activation)
+            self.logger.error(
+                f"❌ Provisioning account activation failed on chain {chain_id}: {detail}"
+            )
+            return None
+
+        refreshed = self._renew_admin_session(str(chain_id))
+        if not refreshed:
+            self._admin_account_failed = True
+            self.logger.error(
+                "❌ Provisioning account activated, but its JWT could not be refreshed"
+            )
+            return None
+
+        fresh_token = refreshed.get("access_token")
+        fresh_entity = get_sub(fresh_token) if isinstance(fresh_token, str) else None
+        fresh_chain = (
+            extract_claim(fresh_token, "default_chain_id", "chain_id", "chainId")
+            if isinstance(fresh_token, str)
+            else None
+        )
+        fresh_address = (
+            extract_claim(fresh_token, "account_address")
+            if isinstance(fresh_token, str)
+            else None
+        )
+        fresh_wallet_id = (
+            extract_claim(fresh_token, "default_wallet_id")
+            if isinstance(fresh_token, str)
+            else None
+        )
+        if (
+            fresh_entity != entity_id
+            or str(fresh_chain or "") != str(chain_id)
+            or not isinstance(fresh_address, str)
+            or not fresh_address
+            or fresh_address.lower() == self._ZERO_ADDRESS
+            or not isinstance(fresh_wallet_id, str)
+            or not fresh_wallet_id
+        ):
+            self._admin_account_failed = True
+            self.logger.error(
+                "❌ Refreshed provisioning JWT does not contain the activated "
+                f"chain-{chain_id} wallet"
+            )
+            return None
+
+        self._admin_session = refreshed
+        self.logger.success(
+            f"  ✅ Provisioning account ready on chain {chain_id}: {fresh_address}"
+        )
+        return fresh_token
 
     # ------------------------------------------------------------------
     # Internals.
@@ -362,9 +567,10 @@ class YieldFabricSetupRunner:
 
             if user_id:
                 self._user_ids[email] = user_id
-                # Log in (triggers the account deploy) and print the
-                # deployed default account address — shell parity.
-                self._print_user_account_address(user_id, email, password)
+                # Setup needs funded/on-chain users, so activate the selected
+                # chain explicitly and print the resulting account address.
+                if not self._print_user_account_address(user_id, email, password):
+                    ok = False
             else:
                 self.logger.warning(
                     f"  ⚠️  {email}: no user_id resolved; cannot show account address"
@@ -381,11 +587,12 @@ class YieldFabricSetupRunner:
             return None
         return get_sub(jwt)
 
-    def _acquire_admin_token(self, users: List[Dict[str, Any]]) -> Optional[str]:
+    def _acquire_admin_session(
+        self, users: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
         """
-        Acquire the admin JWT used to PROVISION users (now required, since the
-        public path rejects elevated roles) and for tokens/assets/fiat and
-        group-member operations. Preference order:
+        Acquire the admin token bundle used to provision users and perform
+        wallet-bound setup. Preference order:
 
           1. `config.api_key` (API_KEY env) — the canonical backend-service
              auth path. Exchanged for a short-lived JWT via POST /auth/api-key.
@@ -402,9 +609,15 @@ class YieldFabricSetupRunner:
         """
         if self.config.api_key:
             self.logger.info("  🔑 Using API key for admin token")
-            token = self.auth_service.authenticate_api_key(self.config.api_key)
-            if token:
-                return token
+            session = self.auth_service.authenticate_api_key_session(
+                self.config.api_key
+            )
+            if session:
+                self._admin_auth_source = {
+                    "kind": "api_key",
+                    "api_key": self.config.api_key,
+                }
+                return session
             self.logger.warning(
                 "  ⚠️  API-key auth failed; trying ADMIN_EMAIL/ADMIN_PASSWORD"
             )
@@ -413,11 +626,16 @@ class YieldFabricSetupRunner:
             self.logger.info(
                 f"  🔑 Acquiring admin token as {self.config.admin_email} (bootstrap admin)"
             )
-            token = self.auth_service.login(
+            session = self.auth_service.login_session(
                 self.config.admin_email, self.config.admin_password
             )
-            if token:
-                return token
+            if session:
+                self._admin_auth_source = {
+                    "kind": "password",
+                    "email": self.config.admin_email,
+                    "password": self.config.admin_password,
+                }
+                return session
             self.logger.warning(
                 "  ⚠️  Admin-credential login failed; falling back to first-user login"
             )
@@ -425,7 +643,18 @@ class YieldFabricSetupRunner:
         if not users:
             return None
         first = users[0]
-        return self.auth_service.login(first.get("id"), first.get("password"))
+        email = first.get("id")
+        password = first.get("password")
+        if not email or not password:
+            return None
+        session = self.auth_service.login_session(email, password)
+        if session:
+            self._admin_auth_source = {
+                "kind": "password",
+                "email": email,
+                "password": password,
+            }
+        return session
 
     def _setup_groups(
         self,
@@ -491,8 +720,10 @@ class YieldFabricSetupRunner:
                 ok = False
                 continue
 
-            # Deploy the group's on-chain account if not already deployed.
-            ok &= self._deploy_group_if_needed(admin_token, name, group_id)
+            # The creator is the initial owner and therefore the canonical
+            # principal for activation and membership changes. An API-key or
+            # bootstrap-admin token can identify a different entity.
+            ok &= self._activate_group_if_needed(creator_token, name, group_id)
 
             # Print the deployed group account address — shell parity.
             self._print_group_account_address(creator_token, group_id, name)
@@ -516,7 +747,9 @@ class YieldFabricSetupRunner:
                     )
                     ok = False
                     continue
-                res = self.auth_service.add_group_member(admin_token, group_id, m_user_id, m_role)
+                res = self.auth_service.add_group_member(
+                    creator_token, group_id, m_user_id, m_role
+                )
                 if res.get("status") in ("added", "exists"):
                     self.logger.success(f"    ✅ member {m_email} ({m_role})")
                 else:
@@ -524,62 +757,64 @@ class YieldFabricSetupRunner:
                     ok = False
         return ok
 
-    def _deploy_group_if_needed(self, admin_token: str, name: str, group_id: str) -> bool:
-        status = self.auth_service.group_account_status(admin_token, group_id)
-        if status == "deployed":
-            self.logger.info(f"  ℹ️  group {name} account already deployed")
-            return True
-        if status == "not_deployed":
-            res = self.auth_service.deploy_group_account(admin_token, group_id)
-            if res.get("status") != "success":
-                self.logger.error(
-                    f"  ❌ deploy group {name} failed: {res.get('message')}"
-                )
-                return False
-            self.logger.info(f"  🚀 group {name} deploy initiated; polling status")
+    def _activate_group_if_needed(
+        self, creator_token: str, name: str, group_id: str
+    ) -> bool:
+        chain_id = extract_claim(creator_token, "default_chain_id")
+        if not isinstance(chain_id, str) or not chain_id:
+            self.logger.error(
+                f"  ❌ group {name}: creator session has no active chain"
+            )
+            return False
 
-            # Poll `/auth/groups/{id}/account-status` until status is
-            # `deployed` rather than sleeping a fixed 3s. Timeout at 60s
-            # — deployment normally completes in a few seconds; anything
-            # past a minute is a genuine backend problem.
-            from ..utils.polling import poll_until
-            try:
-                poll_until(
-                    lambda: self.auth_service.group_account_status(admin_token, group_id),
-                    lambda s: s == "deployed",
-                    interval=1.0,
-                    timeout=60.0,
-                    description=f"group {name} account to be deployed",
-                )
-            except TimeoutError as e:
-                self.logger.error(f"  ❌ deploy group {name}: {e}")
-                return False
-            self.logger.success(f"  ✅ group {name} account deployed")
+        state = self.auth_service.wait_for_chain_account_activation(
+            creator_token,
+            "group",
+            group_id,
+            chain_id,
+            attempts=self._ACCT_POLL_ATTEMPTS,
+            interval=self._ACCT_POLL_INTERVAL,
+        )
+        status = state.get("status")
+        if status == "ready":
+            self.logger.success(
+                f"  ✅ group {name} account ready on chain {chain_id}"
+            )
             return True
-        # Unknown status — log and continue (non-fatal).
-        self.logger.warning(f"  ⚠️  group {name} account status: {status!r}")
-        return True
+        if status == "pending_signature":
+            self.logger.warning(
+                f"  ⚠️  group {name} activation awaits a wallet signature"
+            )
+        elif status == "failed_retryable":
+            self.logger.error(
+                f"  ❌ group {name} activation failed: "
+                f"{state.get('error', 'unknown error')}"
+            )
+        else:
+            self.logger.error(
+                f"  ❌ group {name} activation did not become ready: {state!r}"
+            )
+        return False
 
     # ------------------------------------------------------------------
     # Deployed account-address reporting — parity with setup_system.sh's
     # print_user_account_address / print_group_account_address.
     #
-    # Account deployment is async (MQ): a user's default account deploys
-    # on first login (auth `ensure_account_deployment_for_auth`); a
-    # group's account deploys on creation. We poll the read endpoints
-    # until the deterministic CREATE2 address appears, then print it.
+    # User login is intentionally off-chain. Setup explicitly activates the
+    # JWT-selected chain because later setup phases fund/use these accounts.
+    # Groups use the same explicit, chain-qualified activation lifecycle.
     # ------------------------------------------------------------------
 
-    _ACCT_POLL_ATTEMPTS = 12       # ~24s ceiling, matching the shell's loop
+    _ACCT_POLL_ATTEMPTS = 60       # ~120s reconciliation window after POST returns
     _ACCT_POLL_INTERVAL = 2.0
     _ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
     def _print_user_account_address(
         self, user_id: str, email: str, password: str
-    ) -> None:
+    ) -> bool:
         """
-        Log in as the user (which ALSO triggers the deploy) and print
-        their default on-chain account address, polling until it shows up.
+        Log in as the user, explicitly activate the JWT-selected chain, and
+        print the resulting smart-account address.
 
         The chain-accounts endpoint forbids reading another user's
         accounts, so this reads with the user's OWN token — exactly as
@@ -588,24 +823,43 @@ class YieldFabricSetupRunner:
         token = self.auth_service.login(email, password)
         if not token:
             self.logger.warning("      🏦 account: (login failed; cannot read address)")
-            return
-        for attempt in range(self._ACCT_POLL_ATTEMPTS):
-            accounts = self.auth_service.get_user_chain_accounts(token, user_id)
-            addr, chain = self._pick_chain_account(accounts)
-            if addr:
-                self.logger.purple(f"      🏦 account: {addr} (chain {chain})")
-                return
-            if attempt < self._ACCT_POLL_ATTEMPTS - 1:
-                time.sleep(self._ACCT_POLL_INTERVAL)
+            return False
+        chain_id = extract_claim(token, "default_chain_id")
+        if not isinstance(chain_id, str) or not chain_id:
+            self.logger.warning("      🏦 account: (session has no active chain)")
+            return False
+        activation = self.auth_service.wait_for_chain_account_activation(
+            token,
+            "user",
+            user_id,
+            chain_id,
+            attempts=self._ACCT_POLL_ATTEMPTS,
+            interval=self._ACCT_POLL_INTERVAL,
+        )
+        addr = activation.get("account_address")
+        chain = activation.get("chain_id") or chain_id
+        if addr:
+            self.logger.purple(f"      🏦 account: {addr} (chain {chain})")
+            return True
+        if activation.get("status") == "failed_retryable":
+            self.logger.warning(
+                f"      🏦 activation failed: {activation.get('error', 'unknown error')}"
+            )
         self.logger.warning("      🏦 account: (not on chain yet)")
+        return False
 
     def _print_group_account_address(
         self, token: str, group_id: str, name: str
     ) -> None:
-        """Print a group's deployed account address, polling the
-        account-status endpoint until the (non-zero) address appears."""
+        """Print the group account from its chain-qualified activation resource."""
+        chain_id = extract_claim(token, "default_chain_id")
+        if not isinstance(chain_id, str) or not chain_id:
+            self.logger.warning("      🏦 account: (session has no active chain)")
+            return
         for attempt in range(self._ACCT_POLL_ATTEMPTS):
-            info = self.auth_service.group_account_info(token, group_id)
+            info = self.auth_service.get_chain_account_activation(
+                token, "group", group_id, chain_id
+            )
             addr = info.get("account_address")
             status = info.get("status")
             if addr and addr != self._ZERO_ADDRESS:
@@ -615,23 +869,6 @@ class YieldFabricSetupRunner:
             if attempt < self._ACCT_POLL_ATTEMPTS - 1:
                 time.sleep(self._ACCT_POLL_INTERVAL)
         self.logger.warning("      🏦 account: (not on chain yet)")
-
-    @staticmethod
-    def _pick_chain_account(accounts: Any):
-        """
-        Mirror the shell's jq selection: prefer the default wallet, else
-        the first account that actually carries an address. Returns
-        (account_address, chain_id) or (None, None).
-        """
-        if not isinstance(accounts, list):
-            return None, None
-        ordered = [a for a in accounts if isinstance(a, dict) and a.get("is_default")]
-        ordered += [a for a in accounts if isinstance(a, dict) and not a.get("is_default")]
-        for a in ordered:
-            addr = a.get("account_address")
-            if addr not in (None, ""):
-                return addr, a.get("chain_id")
-        return None, None
 
     @staticmethod
     def _normalize_eth_address(value: Any) -> str:
@@ -776,8 +1013,8 @@ class YieldFabricSetupRunner:
         `setup_group_relationships`.
 
         For each declared group: resolve its real UUID by name (YAML ids
-        are human labels, not UUIDs), ensure the on-chain account is
-        deployed, then for every declared member add them BOTH as a group
+        are human labels, not UUIDs), explicitly activate the creator JWT's
+        chain account, then for every declared member add them BOTH as a group
         member (role-scoped) AND as an on-chain account owner. The
         add-owner call uses a group-scoped delegation JWT, matching the
         shell's `add_member_as_owner`.
@@ -800,18 +1037,27 @@ class YieldFabricSetupRunner:
 
             members = group.get("members") or []
 
+            # Resolve the initial owner's credential before any create or
+            # activation call. The bootstrap/API-key token is only a fallback
+            # when the YAML intentionally omits a creator.
+            creator = group.get("user") or {}
+            member_token = admin_token
+            if creator.get("id") and creator.get("password"):
+                ct = self.auth_service.login(creator["id"], creator["password"])
+                if not ct:
+                    self.logger.error(
+                        f"  ❌ could not log in creator {creator['id']} for {name}"
+                    )
+                    ok = False
+                    continue
+                member_token = ct
+
             # Resolve the real group UUID by name.
             group_id = self.auth_service.get_group_id_by_name(admin_token, name)
             if not group_id:
                 # Mirror the shell: try to create it, then re-resolve.
-                creator = group.get("user") or {}
-                creator_token = admin_token
-                if creator.get("id") and creator.get("password"):
-                    ct = self.auth_service.login(creator["id"], creator["password"])
-                    if ct:
-                        creator_token = ct
                 self.auth_service.create_group(
-                    creator_token,
+                    member_token,
                     name=name,
                     description=group.get("description") or "",
                     group_type=group.get("group_type", "project"),
@@ -822,21 +1068,14 @@ class YieldFabricSetupRunner:
                 ok = False
                 continue
 
-            # The account must be deployed before owners can be added.
-            ok &= self._deploy_group_if_needed(admin_token, name, group_id)
+            # The account must be ready before owners can be added.
+            if not self._activate_group_if_needed(member_token, name, group_id):
+                ok = False
+                continue
 
             if not members:
                 self.logger.info(f"  ℹ️  group {name} has no members; nothing to own")
                 continue
-
-            # Prefer the group creator's token for member/owner ops (the
-            # shell does this); fall back to the admin token.
-            creator = group.get("user") or {}
-            member_token = admin_token
-            if creator.get("id") and creator.get("password"):
-                ct = self.auth_service.login(creator["id"], creator["password"])
-                if ct:
-                    member_token = ct
 
             # add-owner expects a group-scoped delegation JWT.
             delegation = self.auth_service.create_delegation_token(
@@ -1008,5 +1247,3 @@ class YieldFabricSetupRunner:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
-
-

@@ -30,7 +30,9 @@ class _UserSession:
 @dataclass
 class _DelegationSession:
     token: str
+    refresh_token: Optional[str]
     group_id: str
+    chain_id: str
     expires_at: float
     issued_at: float
 
@@ -89,14 +91,18 @@ class TokenManager:
 
     def refresh_token_for_access_token(self, access_token: str) -> Optional[str]:
         """
-        Return the cached refresh token paired with a user access JWT.
+        Return the cached refresh token paired with this exact access JWT.
 
-        Delegation JWTs intentionally have no refresh token, so they
-        never match this user-session lookup.
+        User and delegation sessions have distinct rotating refresh secrets;
+        callers must forward the one paired with the presented access token.
         """
         if not access_token:
             return None
         with self._lock:
+            for session in self._delegations.values():
+                if session.token == access_token:
+                    token = session.refresh_token
+                    return token if token and token.strip() else None
             for session in self._users.values():
                 if session.access_token == access_token:
                     token = session.refresh_token
@@ -165,6 +171,45 @@ class TokenManager:
             if delegation and not self._is_expiring(delegation.issued_at, delegation.expires_at):
                 return delegation.token
 
+            if delegation and delegation.refresh_token:
+                refreshed = self.auth_service.refresh_access_token(
+                    delegation.refresh_token,
+                    chain_id=delegation.chain_id,
+                )
+                if refreshed and refreshed.get("access_token"):
+                    now = self._now()
+                    token = refreshed["access_token"]
+                    renewed = _DelegationSession(
+                        token=token,
+                        refresh_token=(
+                            refreshed.get("refresh_token")
+                            or delegation.refresh_token
+                        ),
+                        group_id=delegation.group_id,
+                        chain_id=str(
+                            extract_claim(
+                                token,
+                                "default_chain_id",
+                                "chain_id",
+                                "chainId",
+                            )
+                            or delegation.chain_id
+                        ),
+                        expires_at=self._expires_at(
+                            token, refreshed.get("expires_in"), now
+                        ),
+                        issued_at=now,
+                    )
+                    self._delegations[key] = renewed
+                    self.logger.debug(
+                        f"  🔁 Refreshed delegation JWT for {group_name}"
+                    )
+                    return renewed.token
+                self.logger.warning(
+                    f"  ⚠️  Delegation refresh for {group_name} was rejected; "
+                    "minting a fresh delegation"
+                )
+
             user_token = self.get_user_token(email, password)
             if not user_token:
                 return None
@@ -178,20 +223,60 @@ class TokenManager:
                     return user_token
                 self._group_ids[key] = group_id
 
-            token = self.auth_service.create_delegation_token(user_token, group_id, group_name)
-            if not token:
+            session = self._create_delegation_session(
+                user_token, group_id, group_name
+            )
+            if not session:
                 self.logger.warning("    ⚠️  Delegation failed, using regular token")
                 return user_token
 
+            token = session["access_token"]
             now = self._now()
             self._delegations[key] = _DelegationSession(
                 token=token,
+                refresh_token=session.get("refresh_token"),
                 group_id=group_id,
-                expires_at=self._expires_at(token, self.config.jwt_expiry_seconds, now),
+                chain_id=str(
+                    session.get("chain_id") or self._chain_id_for_token(token)
+                ),
+                expires_at=self._expires_at(
+                    token,
+                    session.get("expires_in") or self.config.jwt_expiry_seconds,
+                    now,
+                ),
                 issued_at=now,
             )
             self.logger.success("    ✅ Group delegation available")
             return token
+
+    def _create_delegation_session(
+        self,
+        user_token: str,
+        group_id: str,
+        group_name: str,
+    ) -> Optional[dict]:
+        """Use the refresh-aware API, falling back to the legacy token API."""
+        create_session = getattr(
+            self.auth_service, "create_delegation_session", None
+        )
+        if callable(create_session):
+            session = create_session(user_token, group_id, group_name)
+            if isinstance(session, dict):
+                return session if session.get("access_token") else None
+            if session is None:
+                return session
+
+        token = self.auth_service.create_delegation_token(
+            user_token, group_id, group_name
+        )
+        if not token:
+            return None
+        return {
+            "access_token": token,
+            "refresh_token": None,
+            "expires_in": self.config.jwt_expiry_seconds,
+            "chain_id": self._chain_id_for_token(token),
+        }
 
     def _login_user(self, email: str, password: str) -> Optional[str]:
         session = self.auth_service.login_session(email, password)
@@ -238,7 +323,7 @@ class TokenManager:
         claim = extract_claim(token, "default_chain_id", "chain_id", "chainId")
         if claim:
             return str(claim)
-        return os.getenv("CHAIN_ID", self._DEFAULT_CHAIN_ID)
+        return self.config.chain_id or os.getenv("CHAIN_ID", self._DEFAULT_CHAIN_ID)
 
     @staticmethod
     def _user_key(email: str) -> str:

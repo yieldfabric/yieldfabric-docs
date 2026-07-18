@@ -66,10 +66,10 @@
 #              lease; non-party cannot settle the exchange; non-executor
 #              (even the OWNER) cannot disburse under the agent's policy;
 #              revoked-policy approve/execute both fail with the novation error
-#    replay    double-collect a leg → terminal-status reject; double-settle the
-#              swap → reject (either layer; exact-deltas prove single movement);
-#              double-accept the lease → IDEMPOTENT NO-OP (pinned deliberate
-#              behavior) with a no-double-escrow zero-delta assert
+#    replay    double-collect a leg → IDEMPOTENT NO-OP that reuses the canonical
+#              retrieve; double-settle the swap → reject (either layer;
+#              exact-deltas prove single movement); double-accept the lease →
+#              IDEMPOTENT NO-OP with a no-double-escrow zero-delta assert
 #    bounds    exchange more credit than collected → escrow Insufficient balance;
 #              over-cap policy send (400 > the novated 300) → amount-bound reject;
 #              accepting a lease never mints tenant cash (one-sided delta guard)
@@ -88,10 +88,10 @@
 #      deliberately one-sided bounds (`lte 0` on accept; `equals 0` on
 #      double-accept) are documented as such and never relaxed to hide a real
 #      movement.
-#    - Async settle races (the false-NEGATIVE risk) are closed with
-#      wait_for_accept_all + a settle `sleep` before every balance read that
-#      follows a batch claim — single `accept`/`accept_obligation` already poll
-#      their message to `executed`, so reads after them are synchronous.
+#    - Async settle races (the false-NEGATIVE risk) are closed by waiting for
+#      every accept_all child message plus a short concurrent-auto-accept grace
+#      before the balance read. Single `accept`/`accept_obligation` already poll
+#      their canonical message through graph post-processing.
 #
 #  WHAT THIS SUITE DOES NOT COVER: the agents/DMS deal layer (drafts, party
 #  signing, deal-gate signSteps, acting_as_group step params) — the Python harness
@@ -155,15 +155,18 @@ commands:
       idempotency_key: rental-fund-tenant-$(date +%s | tee /tmp/yf_rental_nonce)
 
   # ═══════════════ 1 — PROPERTY GROUP (the property account) ═══════════════
-  # create_group is idempotent by name and POLLS the on-chain account deploy to
-  # `deployed`, so everything below can rely on the account existing. Outputs:
+  # The nonce suffix gives every invocation a fresh property wallet, so aborted
+  # runs cannot leave credit that changes later balance-bound negatives. The
+  # YAML anchor keeps every delegation on that exact generated group name.
+  # create_group POLLS the on-chain account deploy to `deployed`, so everything
+  # below can rely on the account existing. Outputs:
   # group_id / account_address / wallet_id (the `WLT-<address>` the policy
   # projection and balance reads key on).
   - name: create_property
     type: create_group
     user: { id: originator@yieldfabric.com, password: originator_password }
     parameters:
-      name: Rental Property 12 Smith St
+      name: &property_group_name "Rental Property 12 Smith St $(cat /tmp/yf_rental_nonce)"
       description: Property account for the rental-flow suite
       group_type: project
 
@@ -180,7 +183,7 @@ commands:
   # authoritative source — the policy projection and reads key on it exactly.
   - name: property_ctx
     type: whoami
-    user: { id: originator@yieldfabric.com, password: originator_password, group: Rental Property 12 Smith St }
+    user: { id: originator@yieldfabric.com, password: originator_password, group: *property_group_name }
 
   # ═══════════════ 2 — AGENT SEND POLICY on the property account ═══════════════
   # Registered acting-as-group (require_group_policy_account), the same shape the
@@ -193,7 +196,7 @@ commands:
   # (lo 0 = no floor — the floor trap is covered by the datapolicy suite).
   - name: add_send_policy
     type: add_data_policy
-    user: { id: originator@yieldfabric.com, password: originator_password, group: Rental Property 12 Smith St }
+    user: { id: originator@yieldfabric.com, password: originator_password, group: *property_group_name }
     parameters:
       account: $property_ctx.default_wallet_id
       wallet_id: $property_ctx.default_wallet_id
@@ -303,7 +306,7 @@ commands:
   # the deterministic PAY-INITIAL-{contract_id}-{index}.
   - name: mint_lease
     type: composed_operation
-    user: { id: originator@yieldfabric.com, password: originator_password, group: Rental Property 12 Smith St }
+    user: { id: originator@yieldfabric.com, password: originator_password, group: *property_group_name }
     parameters:
       idempotency_key: rental-mint-$(date +%s)
       operations:
@@ -347,6 +350,24 @@ commands:
     user: { id: payer@yieldfabric.com, password: payer_password }
     parameters: { asset_id: aud-token-asset }
 
+  # Take the property-credit baseline before acceptance creates either leg.
+  # This remains deterministic even if this wallet was explicitly armed for
+  # auto-accept by an earlier UI session: an automatic collect may win later,
+  # but it cannot predate this snapshot.
+  - name: group_credit_b0
+    type: balance
+    user: { id: originator@yieldfabric.com, password: originator_password, group: *property_group_name }
+    parameters: { asset_id: aud-token-asset, obligor: $tenant_ctx.user_id }
+
+  # Fail at the fixture boundary if account isolation ever regresses. The
+  # later 2000-vs-1000 insufficient-balance negative depends on a clean bucket.
+  - name: assert_property_credit_starts_clean
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      actual: "$group_credit_b0.private_balance"
+      equals: "0"
+
   - name: tenant_accept_lease
     type: accept_obligation
     user: { id: payer@yieldfabric.com, password: payer_password }
@@ -375,21 +396,16 @@ commands:
   # PAY-INITIAL-{contract_id}-{index}. The group claims leg 0 (already due).
   # NO cash moves at collect — the property account gains obligor-bound CREDIT
   # (due from the tenant), read via the balance obligor split.
-  - name: group_credit_b0
-    type: balance
-    user: { id: originator@yieldfabric.com, password: originator_password, group: Rental Property 12 Smith St }
-    parameters: { asset_id: aud-token-asset, obligor: $tenant_ctx.user_id }
-
   - name: collect_rent_1
     type: accept
-    user: { id: originator@yieldfabric.com, password: originator_password, group: Rental Property 12 Smith St }
+    user: { id: originator@yieldfabric.com, password: originator_password, group: *property_group_name }
     parameters:
       payment_id: PAY-INITIAL-$mint_lease.contract_id-0
       idempotency_key: rental-collect1-$(date +%s)
 
   - name: group_credit_a1
     type: balance
-    user: { id: originator@yieldfabric.com, password: originator_password, group: Rental Property 12 Smith St }
+    user: { id: originator@yieldfabric.com, password: originator_password, group: *property_group_name }
     parameters: { asset_id: aud-token-asset, obligor: $tenant_ctx.user_id }
 
   - name: assert_collect_credited_exactly
@@ -400,36 +416,42 @@ commands:
       minus:  "$group_credit_b0.private_balance"
       equals: "1000000000000000000000"
 
-  # ─── negative: DOUBLE-COLLECT — re-claiming the already-collected leg must
-  #     fail (replay protection). The resolver's terminal-status gate rejects
-  #     it: once the payment row is COMPLETED, Payment+Complete requires
-  #     PENDING/PROCESSING (primitive_action_policy.rs → "terminal status").
-  #     DETERMINISM NOTE: this MUST run after the leg's retrieve
-  #     post-processing has written COMPLETED and cleared the in-flight
-  #     retrieve context — otherwise the resolver's pending-retrieve
-  #     short-circuit returns a synthesised SUCCESS (idempotent in-flight
-  #     reply), which would break this negative. The sleep guarantees we're
-  #     past the ~5s post-processing window (collect_rent_1 already polled
-  #     its message to `executed`). ───
+  # ─── DOUBLE-COLLECT is an IDEMPOTENT NO-OP. Once the first retrieve has
+  #     settled, the resolver verifies its durable transaction anchor, MQ
+  #     envelope and post-processing record, then returns ALREADY_SATISFIED
+  #     with the original canonical message id. No second retrieve is queued.
+  #     The short lag makes this exercise the completed postcondition rather
+  #     than the equally-idempotent IN_FLIGHT response. ───
   - name: double_collect_settle_lag
     type: sleep
     user: { id: originator@yieldfabric.com, password: originator_password }
     parameters: { seconds: 12 }
 
-  - name: double_collect_rent_1_fails
+  - name: double_collect_rent_1_idempotent
     type: accept
-    user: { id: originator@yieldfabric.com, password: originator_password, group: Rental Property 12 Smith St }
+    user: { id: originator@yieldfabric.com, password: originator_password, group: *property_group_name }
     parameters:
       payment_id: PAY-INITIAL-$mint_lease.contract_id-0
       idempotency_key: rental-collect1-replay-$(date +%s)
-      expect_failure: true
-      expect_error: "terminal status"
 
-  # Conservation backstop (race-proof regardless of which layer rejected):
-  # the failed double-collect must not have minted a second credit.
+  - name: assert_double_collect_satisfied
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      actual: "$double_collect_rent_1_idempotent.disposition"
+      equals: "ALREADY_SATISFIED"
+
+  - name: assert_double_collect_reused_message
+    type: assert
+    user: { id: originator@yieldfabric.com, password: originator_password }
+    parameters:
+      actual: "$double_collect_rent_1_idempotent.message_id"
+      equals: "$collect_rent_1.message_id"
+
+  # Conservation backstop: the successful replay must not mint second credit.
   - name: group_credit_after_double
     type: balance
-    user: { id: originator@yieldfabric.com, password: originator_password, group: Rental Property 12 Smith St }
+    user: { id: originator@yieldfabric.com, password: originator_password, group: *property_group_name }
     parameters: { asset_id: aud-token-asset, obligor: $tenant_ctx.user_id }
 
   - name: assert_no_double_credit
@@ -451,7 +473,7 @@ commands:
   #     locked single-payment accepts, so this is the real rejection path. ───
   - name: collect_rent_2_early_fails
     type: accept
-    user: { id: originator@yieldfabric.com, password: originator_password, group: Rental Property 12 Smith St }
+    user: { id: originator@yieldfabric.com, password: originator_password, group: *property_group_name }
     parameters:
       payment_id: PAY-INITIAL-$mint_lease.contract_id-1
       idempotency_key: rental-collect2-early-$(date +%s)
@@ -500,7 +522,7 @@ commands:
   #     cannot be sold twice or out of thin air. ───
   - name: exchange_over_credit_fails
     type: create_swap
-    user: { id: originator@yieldfabric.com, password: originator_password, group: Rental Property 12 Smith St }
+    user: { id: originator@yieldfabric.com, password: originator_password, group: *property_group_name }
     parameters:
       swap_id: "$(cat /tmp/yf_rental_nonce)8"
       deadline: $(date -u -v+30d +%Y-%m-%dT%H:%M:%SZ)
@@ -523,7 +545,7 @@ commands:
 
   - name: exchange_create
     type: create_swap
-    user: { id: originator@yieldfabric.com, password: originator_password, group: Rental Property 12 Smith St }
+    user: { id: originator@yieldfabric.com, password: originator_password, group: *property_group_name }
     parameters:
       swap_id: "$(cat /tmp/yf_rental_nonce)7"
       deadline: $(date -u -v+30d +%Y-%m-%dT%H:%M:%SZ)
@@ -545,7 +567,7 @@ commands:
   # The group's credit escrows at create.
   - name: group_credit_a2
     type: balance
-    user: { id: originator@yieldfabric.com, password: originator_password, group: Rental Property 12 Smith St }
+    user: { id: originator@yieldfabric.com, password: originator_password, group: *property_group_name }
     parameters: { asset_id: aud-token-asset, obligor: $tenant_ctx.user_id }
 
   - name: assert_exchange_escrowed_credit
@@ -609,19 +631,19 @@ commands:
 
   - name: group_cash_b
     type: balance
-    user: { id: originator@yieldfabric.com, password: originator_password, group: Rental Property 12 Smith St }
+    user: { id: originator@yieldfabric.com, password: originator_password, group: *property_group_name }
     parameters: { asset_id: aud-token-asset }
 
   - name: group_claim_settlement
     type: accept
-    user: { id: originator@yieldfabric.com, password: originator_password, group: Rental Property 12 Smith St }
+    user: { id: originator@yieldfabric.com, password: originator_password, group: *property_group_name }
     parameters:
       payment_id: PAY-SWAP-$(cat /tmp/yf_rental_nonce)7-counterparty-0
       idempotency_key: rental-claimcash-$(date +%s)
 
   - name: group_cash_a
     type: balance
-    user: { id: originator@yieldfabric.com, password: originator_password, group: Rental Property 12 Smith St }
+    user: { id: originator@yieldfabric.com, password: originator_password, group: *property_group_name }
     parameters: { asset_id: aud-token-asset }
 
   - name: assert_settlement_cash_landed
@@ -659,7 +681,7 @@ commands:
 
   - name: direct_send
     type: instant
-    user: { id: originator@yieldfabric.com, password: originator_password, group: Rental Property 12 Smith St }
+    user: { id: originator@yieldfabric.com, password: originator_password, group: *property_group_name }
     parameters:
       asset_id: aud-token-asset
       amount: 200000000000000000000
@@ -693,7 +715,7 @@ commands:
   #    operation_data is the MQ SendData shape; the token resolves from the slug.
   - name: agent_policy_send
     type: execute_under_policy
-    user: { id: collateral@yieldfabric.com, password: collateral_password, group: Rental Property 12 Smith St }
+    user: { id: collateral@yieldfabric.com, password: collateral_password, group: *property_group_name }
     parameters:
       account: $property_ctx.default_wallet_id
       policy_id: "$(cat /tmp/yf_rental_nonce)9"
@@ -704,19 +726,14 @@ commands:
         amount: "100000000000000000000"
       idempotency_key: rental-policysend-$(date +%s)
 
-  # The landlord claims the policy disbursement (id not surfaced by
-  # executeUnderPolicy, so it can't be a single `accept`). TWO async edges to
-  # cover — plain `accept_all` has neither (its `wait: true` is a no-op):
-  #   leading:  the payable row is written by post-processing slightly after
-  #             the execute message settles → wait_for_accept_all re-calls
-  #             acceptAll until acceptedCount > 0 (the canonical
-  #             loan_management pattern);
-  #   trailing: acceptedCount counts SUBMITTED accepts — the retrieve itself
-  #             settles a few seconds later (observed ~5s locally), so the
-  #             balance read needs a settle beat. Single `accept` commands
-  #             don't have this race (they poll their message to `executed`).
+  # The landlord claims the policy disbursement (its id is not surfaced by
+  # executeUnderPolicy, so it cannot be a single `accept`). The upstream
+  # command waits through graph post-processing, then accept_all waits for
+  # every child retrieve it submits. If wallet auto-accept won the race, an
+  # empty sweep is a valid no-op; the exact balance delta below remains the
+  # authoritative proof that the expected money arrived.
   - name: landlord_accept_policy_send
-    type: wait_for_accept_all
+    type: accept_all
     user: { id: originator@yieldfabric.com, password: originator_password }
     parameters:
       denomination: aud-token-asset
@@ -743,7 +760,7 @@ commands:
   # Property account cash after both disbursements: 1000 − 200 − 100 = 700.
   - name: group_cash_final
     type: balance
-    user: { id: originator@yieldfabric.com, password: originator_password, group: Rental Property 12 Smith St }
+    user: { id: originator@yieldfabric.com, password: originator_password, group: *property_group_name }
     parameters: { asset_id: aud-token-asset }
 
   - name: assert_property_cash_conserved
@@ -766,7 +783,7 @@ commands:
   # per-transfer cap tightened 500 → 300 AUD.
   - name: novate_policy
     type: add_data_policy
-    user: { id: originator@yieldfabric.com, password: originator_password, group: Rental Property 12 Smith St }
+    user: { id: originator@yieldfabric.com, password: originator_password, group: *property_group_name }
     parameters:
       account: $property_ctx.default_wallet_id
       wallet_id: $property_ctx.default_wallet_id
@@ -796,7 +813,7 @@ commands:
   #   revoking a partially-used policy is the realistic mid-tenancy shape.
   - name: retire_predecessor
     type: remove_data_policy
-    user: { id: originator@yieldfabric.com, password: originator_password, group: Rental Property 12 Smith St }
+    user: { id: originator@yieldfabric.com, password: originator_password, group: *property_group_name }
     parameters:
       account: $property_ctx.default_wallet_id
       wallet_id: $property_ctx.default_wallet_id
@@ -878,7 +895,7 @@ commands:
 
   - name: agent_execute_revoked_fails
     type: execute_under_policy
-    user: { id: collateral@yieldfabric.com, password: collateral_password, group: Rental Property 12 Smith St }
+    user: { id: collateral@yieldfabric.com, password: collateral_password, group: *property_group_name }
     parameters:
       account: $property_ctx.default_wallet_id
       policy_id: "$(cat /tmp/yf_rental_nonce)9"
@@ -901,7 +918,7 @@ commands:
   #     policy. ───
   - name: landlord_not_executor_fails
     type: execute_under_policy
-    user: { id: originator@yieldfabric.com, password: originator_password, group: Rental Property 12 Smith St }
+    user: { id: originator@yieldfabric.com, password: originator_password, group: *property_group_name }
     parameters:
       account: $property_ctx.default_wallet_id
       policy_id: "$(cat /tmp/yf_rental_nonce)91"
@@ -922,7 +939,7 @@ commands:
   #     terms, not just re-registered them. ───
   - name: agent_over_cap_send_fails
     type: execute_under_policy
-    user: { id: collateral@yieldfabric.com, password: collateral_password, group: Rental Property 12 Smith St }
+    user: { id: collateral@yieldfabric.com, password: collateral_password, group: *property_group_name }
     parameters:
       account: $property_ctx.default_wallet_id
       policy_id: "$(cat /tmp/yf_rental_nonce)91"
@@ -939,7 +956,7 @@ commands:
   #     tightened 300 AUD cap) and the money genuinely moves. ───
   - name: agent_send_under_successor
     type: execute_under_policy
-    user: { id: collateral@yieldfabric.com, password: collateral_password, group: Rental Property 12 Smith St }
+    user: { id: collateral@yieldfabric.com, password: collateral_password, group: *property_group_name }
     parameters:
       account: $property_ctx.default_wallet_id
       policy_id: "$(cat /tmp/yf_rental_nonce)91"
@@ -950,10 +967,9 @@ commands:
         amount: "100000000000000000000"
       idempotency_key: rental-successor-send-$(date +%s)
 
-  # Same two-edge claim pattern as the stage-8 policy payout (see the comment
-  # there): poll until the payable materializes, then let the retrieve settle.
+  # Same scheduler-safe batch-claim pattern as the stage-8 policy payout.
   - name: landlord_accept_successor_send
-    type: wait_for_accept_all
+    type: accept_all
     user: { id: originator@yieldfabric.com, password: originator_password }
     parameters:
       denomination: aud-token-asset
@@ -980,7 +996,7 @@ commands:
   # Property account cash after the successor disbursement: 700 − 100 = 600.
   - name: group_cash_after_novate
     type: balance
-    user: { id: originator@yieldfabric.com, password: originator_password, group: Rental Property 12 Smith St }
+    user: { id: originator@yieldfabric.com, password: originator_password, group: *property_group_name }
     parameters: { asset_id: aud-token-asset }
 
   - name: assert_cash_after_novate
@@ -993,24 +1009,25 @@ commands:
 
   # ═══════════════ 10 — MATURITY: the future leg becomes collectable ═══════════════
   # Jump the chain past leg 2's due instant (+6h ⇒ advance 25000s, cumulative;
-  # test-node only). The single-payment `accept` is REQUIRED here: the backend's
-  # accept_all filters locked payments by WALL clock and would skip this leg,
-  # while the single accept only warns and lets the (advanced) chain decide.
+  # test-node only). The early negative attempt already owns this payment's
+  # canonical Retrieve message. Once the maturity condition changes, redrive
+  # that exact message so its proof is rebuilt against current chain state; a
+  # second `accept` is correctly rejected as a duplicate canonical claim.
   - name: advance_past_leg2_due
     type: advance_chain_time
     user: { id: originator@yieldfabric.com, password: originator_password }
     parameters: { seconds: 25000 }
 
   - name: collect_rent_2
-    type: accept
-    user: { id: originator@yieldfabric.com, password: originator_password, group: Rental Property 12 Smith St }
+    type: retry_message
+    user: { id: originator@yieldfabric.com, password: originator_password, group: *property_group_name }
     parameters:
-      payment_id: PAY-INITIAL-$mint_lease.contract_id-1
-      idempotency_key: rental-collect2-$(date +%s)
+      message_id: $collect_rent_2_early_fails.message_id
+      execution_mode: Automatic
 
   - name: group_credit_a3
     type: balance
-    user: { id: originator@yieldfabric.com, password: originator_password, group: Rental Property 12 Smith St }
+    user: { id: originator@yieldfabric.com, password: originator_password, group: *property_group_name }
     parameters: { asset_id: aud-token-asset, obligor: $tenant_ctx.user_id }
 
   - name: assert_leg2_credited_exactly

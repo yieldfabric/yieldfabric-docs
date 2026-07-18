@@ -15,6 +15,21 @@ YieldFabric's swap system enables atomic trading of obligations and payments bet
 
 **Important**: Users primarily interact with swaps through the GraphQL API. The swap system provides atomic settlement guarantees, ensuring either both sides execute or neither does.
 
+### Transaction IDs are opaque
+
+The `transactionId` returned by a swap mutation is a chain-scoped submission
+anchor. Submission anchors are UUID-backed (`TXN-{OPERATION}-{UUID}`), but the
+authoritative chain is the anchor's EIP-155 scope, not a value to infer from the
+ID text. Use the returned ID verbatim; do not construct or parse it.
+
+Asynchronous post-processing can create stable transaction records for a
+logical swap operation. Those deterministic IDs are explicitly chain-qualified
+and have the schematic shape
+`TXN-{KIND}-eip155-{CHAIN_ID}-v1-{HEX_COMPONENT}[-{HEX_COMPONENT}...]`.
+Each source component is UTF-8 hex encoded separately, so these IDs are also
+opaque. The same logical operation on testnet and mainnet produces distinct
+IDs.
+
 ---
 
 ## Swap Types
@@ -210,7 +225,7 @@ mutation {
       "counterparty": "counterpart@yieldfabric.com",
       "swapResult": "PENDING",
       "messageId": "msg-swap-123",
-      "transactionId": "TXN-CREATE-SWAP-123456789",
+      "transactionId": "TXN-CREATE-SWAP-<uuid>",
       "timestamp": "2025-10-20T03:51:25.797693681+00:00"
     }
   }
@@ -280,7 +295,7 @@ mutation {
       "swapId": "123456789",
       "completeResult": "Message queued for processing with ID: msg-complete-123",
       "messageId": "msg-complete-123",
-      "transactionId": "TXN-COMPLETE-SWAP-123456789",
+      "transactionId": "TXN-COMPLETE-SWAP-<uuid>",
       "signature": "0xdef...",
       "timestamp": "2025-10-20T03:51:28.040236966+00:00"
     }
@@ -353,7 +368,7 @@ mutation {
       "swapId": "123456789",
       "cancelResult": "Message queued for processing with ID: msg-cancel-123",
       "messageId": "msg-cancel-123",
-      "transactionId": "TXN-CANCEL-SWAP-123456789",
+      "transactionId": "TXN-CANCEL-SWAP-<uuid>",
       "signature": "0xabc...",
       "timestamp": "2025-10-20T03:51:30.123456789+00:00"
     }
@@ -428,7 +443,7 @@ mutation {
       "swapId": "987654321",
       "repurchaseResult": "Message queued for processing with ID: msg-repurchase-123",
       "messageId": "msg-repurchase-123",
-      "transactionId": "TXN-REPURCHASE-SWAP-987654321",
+      "transactionId": "TXN-REPURCHASE-SWAP-<uuid>",
       "signature": "0xdef...",
       "timestamp": "2025-12-05T10:30:00.123456789+00:00"
     }
@@ -522,7 +537,7 @@ mutation {
       "oldSwapId": "987654321",
       "newSwapId": "987654322",
       "messageId": "msg-initiate-roll-123",
-      "transactionId": "TXN-INITIATE-ROLL-...",
+      "transactionId": "TXN-INITIATE-ROLL-<uuid>",
       "signature": "0x...",
       "timestamp": "2025-12-01T10:00:00.000Z"
     }
@@ -587,7 +602,7 @@ mutation {
       "accountAddress": "0x...",
       "newSwapId": "987654322",
       "messageId": "msg-complete-roll-123",
-      "transactionId": "TXN-COMPLETE-ROLL-...",
+      "transactionId": "TXN-COMPLETE-ROLL-<uuid>",
       "signature": "0x...",
       "timestamp": "2025-12-02T14:00:00.000Z"
     }
@@ -654,7 +669,7 @@ mutation {
       "swapId": "987654321",
       "expireResult": "Message queued for processing with ID: msg-expire-123",
       "messageId": "msg-expire-123",
-      "transactionId": "TXN-EXPIRE-COLLATERAL-987654321",
+      "transactionId": "TXN-EXPIRE-COLLATERAL-<uuid>",
       "signature": "0xghi...",
       "timestamp": "2025-12-11T00:00:00.123456789+00:00"
     }

@@ -27,12 +27,12 @@
 #  MODEL (the rental "agency" mapped onto the policy primitive, via a deal):
 #    G        = "Issuer Group"          — the PROPERTY group account; sends run ON G.
 #                                         Pre-existing + FUNDED OUT-OF-BAND below.
-#    landlord = issuer (deal PROPOSER; owns G) — mints the agency NFT TO G, hands
-#                                         it to agent A, registers + (auto-)approves
-#                                         the send policy. Registrar == sole required
-#                                         signer ⇒ the policy auto-approves at
-#                                         registration (no approve step — same as
-#                                         doc_escrow_dms_suite).
+#    landlord = Issuer Group (deal PROPOSER and owner of G). The issuer operates
+#                                         under group delegation to mint the agency
+#                                         NFT TO G, hand it to agent A, and register
+#                                         the send policy. The issuer's own wallet
+#                                         is the sole required signer, so registration
+#                                         also auto-approves it (no approve step).
 #    agent A  = collateral (deal party) — the FIRST managing agent; receives the
 #                                         agency NFT, executes the policy, then hands
 #                                         the NFT to agent B.
@@ -72,8 +72,10 @@
 #  the whole deal, so they cannot live in the DAG).
 #
 #  ──────────────────────────────────────────────────────────────────────────
-#  STATUS — 2026-06-16: PASSES end-to-end (confirmed live), AND it CAUGHT A REAL SILENT
-#  BACKEND BUG on the way there. Full DMS chain green: propose → both signs → ACTIVE →
+#  STATUS — 2026-06-16: the prior lifecycle passed live and caught a real silent
+#  backend bug. 2026-07-16: updated to explicit proposer activation and group-as-
+#  proposer ownership; this revision still needs a live rerun. Intended chain:
+#  propose → both signs → activate → ACTIVE →
 #  mint_agency → transfer_to_agent_a → register_send_policy → agent_a_executes →
 #  transfer_a_to_b → agent_b_executes (agent B executes purely by holding the transferred
 #  NFT), plus the fund-movement assert and the two post-deal negatives. THE BUG it exposed:
@@ -185,7 +187,7 @@ commands:
   # pre-funded Issuer Group account.
   - name: propose_agency
     type: propose_deal
-    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
     parameters:
       name: "Property Agency (DMS) $(cat /tmp/yf_agency_dms_nonce)"
       parties:
@@ -299,9 +301,10 @@ commands:
     user: { id: issuer@yieldfabric.com, password: issuer_password }
     parameters: { actual: "$propose_agency.deal_id", contains: "DEAL" }
 
-  # ═══════════════ 2 — BOTH AGENTS SIGN → ACTIVATE ═══════════════
-  # The proposer (landlord) auto-signs at propose. Agent A + agent B each sign; the
-  # LAST signer flips Proposed → Active and starts the DAG.
+  # ═══════════════ 2 — BOTH AGENTS SIGN, THEN LANDLORD ACTIVATES ═══════════════
+  # Issuer Group auto-signs as proposer. Agent A + agent B each sign; the
+  # last counterparty signature moves Proposed → Accepted. The proposer then
+  # activates the deal and starts the DAG.
   - name: agent_a_sign
     type: sign_deal
     user: { id: collateral@yieldfabric.com, password: collateral_password }
@@ -310,16 +313,24 @@ commands:
     type: sign_deal
     user: { id: investor@yieldfabric.com, password: investor_password }
     parameters: { deal_id: $propose_agency.deal_id }
-  - name: assert_deal_active
+  - name: assert_deal_accepted
     type: assert
     user: { id: investor@yieldfabric.com, password: investor_password }
-    parameters: { actual: "$agent_b_sign.status", equals: "ACTIVE" }
+    parameters: { actual: "$agent_b_sign.status", equals: "ACCEPTED" }
+  - name: activate_agency
+    type: activate_deal
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { deal_id: $propose_agency.deal_id }
+  - name: assert_deal_active
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters: { actual: "$activate_agency.status", equals: "ACTIVE" }
 
   # ═══════════════ 3 — DRIVE THE DAG STEPS (caveat A) ═══════════════
   # Step 1: G mints the agency credential to itself.
   - name: exec_mint_agency
     type: execute_step
-    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
     parameters: { deal_id: $propose_agency.deal_id, step_id: mint_agency, find_timeout: 120 }
   - name: await_mint
     type: sleep
@@ -329,7 +340,7 @@ commands:
   # Step 2: G transfers the credential to agent A.
   - name: exec_transfer_to_a
     type: execute_step
-    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
     parameters: { deal_id: $propose_agency.deal_id, step_id: transfer_to_agent_a, find_timeout: 120 }
   - name: await_transfer_a
     type: sleep
@@ -340,7 +351,7 @@ commands:
   # Must settle + project before agent A's execute resolves ownerOf off-chain.
   - name: exec_register_policy
     type: execute_step
-    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
     parameters: { deal_id: $propose_agency.deal_id, step_id: register_send_policy, find_timeout: 120 }
   # Settle wait: the AddDataPolicy POST-SETTLE hook must write the `data_policies` projection (incl.
   # the non-zero executors_id NFT slot) before agent_a_executes' off-chain delegation mint reads it

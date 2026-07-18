@@ -191,6 +191,15 @@ class MessageSignatureListener:
             return
 
         unsigned_tx = poll.observation
+        unsigned_transaction_id = unsigned_tx.get("unsigned_transaction_id")
+        if not isinstance(unsigned_transaction_id, str) or not unsigned_transaction_id.strip():
+            self.logger.error(
+                f"  ❌ unsigned transaction for {message_id[:8]}... has no "
+                "unsigned_transaction_id"
+            )
+            self.errored_count += 1
+            return
+
         try:
             signature_hex = self._sign_callback(unsigned_tx)
         except Exception as e:
@@ -209,7 +218,11 @@ class MessageSignatureListener:
 
         try:
             result = self._payments.submit_signed_message(
-                self._user_id, message_id, signature_hex, self._token_value()
+                self._user_id,
+                message_id,
+                signature_hex,
+                unsigned_transaction_id,
+                self._token_value(),
             )
         except Exception as e:
             self.logger.error(

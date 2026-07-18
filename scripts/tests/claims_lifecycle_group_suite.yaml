@@ -5,9 +5,9 @@
 #  end-to-end against the live runtime, for an individual issuer AND a group
 #  (delegation) issuer:
 #
-#    • ACCOUNT EXISTENCE      — whoami proves the caller's confidential
-#                               ConfidentialAccount (deployed at signup, re-ensured
-#                               idempotently on every login).
+#    • ACCOUNT EXISTENCE      — setup explicitly activates the JWT-selected
+#                               chain; whoami proves the resulting confidential
+#                               ConfidentialAccount before this suite uses it.
 #    • GROUP ACCOUNT CREATION — create_group + on-chain group account deploy.
 #    • DEPLOY TOKEN           — deploy_token: a fresh ERC-3643 compliant token
 #                               via CompliantTokenFactory (CREATE2 factory).
@@ -67,11 +67,13 @@
 commands:
 
   # ════════ C — ACCOUNT EXISTENCE ════════
-  # A user's ConfidentialAccount is deployed at signup and re-ensured idempotently
-  # on every login (auth `ensure_account_deployment`), so whoami alone proves it
-  # exists on-chain. NOTE: we intentionally do NOT call the `deploy_account`
-  # endpoint — that endpoint (`deploy_wallet_account`) deploys an ADDITIONAL
-  # wallet, which is not what "ensure the account exists" means.
+  # Signup/login are intentionally off-chain. This suite needs real transaction
+  # accounts, so it activates each user's JWT-selected chain explicitly before
+  # asserting the wallet claim.
+  - name: c_activate_payer
+    type: deploy_account
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: {}
   - name: c_payer_ctx
     type: whoami
     user: { id: payer@yieldfabric.com, password: payer_password }
@@ -81,6 +83,10 @@ commands:
     user: { id: payer@yieldfabric.com, password: payer_password }
     parameters: { actual: "$c_payer_ctx.account_address", contains: "0x" }
 
+  - name: c_activate_investor
+    type: deploy_account
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: {}
   - name: c_investor_ctx
     type: whoami
     user: { id: investor@yieldfabric.com, password: investor_password }

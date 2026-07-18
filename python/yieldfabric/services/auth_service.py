@@ -2,10 +2,12 @@
 Auth service client
 """
 
+import time
 from typing import List, Optional
 
 from .base import BaseServiceClient
 from ..config import YieldFabricConfig
+from ..utils.jwt import extract_claim
 
 
 class AuthService(BaseServiceClient):
@@ -50,13 +52,36 @@ class AuthService(BaseServiceClient):
             expires_in = data.get('expires_in') or data.get('expiresIn')
             
             if token:
-                self.logger.success("    ✅ Login successful")
-                return {
+                session = {
                     "access_token": token,
                     "refresh_token": refresh_token,
                     "expires_in": expires_in,
                     "raw": data,
                 }
+
+                target_chain = self.config.chain_id
+                current_chain = extract_claim(
+                    token, "default_chain_id", "chain_id", "chainId"
+                )
+                if target_chain and str(current_chain or "") != target_chain:
+                    if not refresh_token:
+                        self.logger.error(
+                            "    ❌ Login cannot pin the session to chain "
+                            f"{target_chain}: no refresh token was returned"
+                        )
+                        return None
+                    self.logger.info(
+                        f"    🔀 Pinning session to chain {target_chain}"
+                    )
+                    pinned = self.refresh_access_token(
+                        refresh_token, chain_id=target_chain
+                    )
+                    if not pinned:
+                        return None
+                    session = pinned
+
+                self.logger.success("    ✅ Login successful")
+                return session
             else:
                 self.logger.error("    ❌ No token in response")
                 return None
@@ -117,13 +142,14 @@ class AuthService(BaseServiceClient):
             self.logger.error(f"    ❌ Token refresh failed: {e}")
             return None
 
-    def authenticate_api_key(self, api_key: str) -> Optional[str]:
+    def authenticate_api_key_session(self, api_key: str) -> Optional[dict]:
         """
-        Exchange a backend-service API key for a short-lived JWT.
+        Exchange a backend-service API key for a short-lived token bundle.
 
         POST /auth/api-key with {"api_key": "yf_api_…"}. The auth service
-        mints a service-scoped JWT carrying the key owner's permissions +
-        entity_scope (same AuthResponse shape as /auth/login), so the
+        mints a permission-complete user JWT for the key owner, carrying the
+        owner's permissions + entity_scope (same AuthResponse shape as
+        /auth/login), so the
         returned token is usable for vault/payments/keys operations —
         unlike the bare password JWT. Issue a key once via
         POST /auth/api-key/generate (with a one-time user JWT).
@@ -132,12 +158,18 @@ class AuthService(BaseServiceClient):
             api_key: The `yf_api_…` secret.
 
         Returns:
-            JWT token or None if the key is invalid / the call fails.
+            Normalized token bundle or None if the key is invalid / the call
+            fails. Keeping the refresh token lets non-interactive setup
+            activate the key owner's lazy chain account and then refresh the
+            JWT's wallet snapshot without re-presenting another credential.
         """
         self.logger.info("  🔑 Authenticating with API key")
 
         try:
-            response = self._post("/auth/api-key", {"api_key": api_key})
+            payload = {"api_key": api_key}
+            if self.config.chain_id:
+                payload["chain_id"] = self.config.chain_id
+            response = self._post("/auth/api-key", payload)
             data = response.json()
 
             self.logger.debug(f"    📡 API-key auth response: {data}")
@@ -146,7 +178,12 @@ class AuthService(BaseServiceClient):
 
             if token:
                 self.logger.success("    ✅ API-key authentication successful")
-                return token
+                return {
+                    "access_token": token,
+                    "refresh_token": data.get('refresh_token') or data.get('refreshToken'),
+                    "expires_in": data.get('expires_in') or data.get('expiresIn'),
+                    "raw": data,
+                }
             else:
                 self.logger.error("    ❌ No token in API-key auth response")
                 return None
@@ -154,6 +191,11 @@ class AuthService(BaseServiceClient):
         except Exception as e:
             self.logger.error(f"    ❌ API-key authentication failed: {e}")
             return None
+
+    def authenticate_api_key(self, api_key: str) -> Optional[str]:
+        """Compatibility wrapper returning only the API-key access token."""
+        session = self.authenticate_api_key_session(api_key)
+        return session.get("access_token") if session else None
 
     def generate_api_key(
         self,
@@ -270,9 +312,14 @@ class AuthService(BaseServiceClient):
         self.logger.error(f"    ❌ Group not found: {group_name}")
         return None
     
-    def create_delegation_token(self, user_token: str, group_id: str, group_name: str) -> Optional[str]:
+    def create_delegation_session(
+        self,
+        user_token: str,
+        group_id: str,
+        group_name: str,
+    ) -> Optional[dict]:
         """
-        Create delegation JWT token for a specific group.
+        Create a delegation JWT and retain its paired refresh token.
         
         Args:
             user_token: User JWT token
@@ -280,7 +327,7 @@ class AuthService(BaseServiceClient):
             group_name: Name of the group (for logging)
             
         Returns:
-            Delegation JWT token or None if creation fails
+            Normalized delegation token bundle or None if creation fails.
         """
         self.logger.info(f"  🎫 Creating delegation JWT for group: {group_name}")
         self.logger.debug(f"    Group ID: {group_id[:8] if group_id else 'N/A'}...")
@@ -295,7 +342,9 @@ class AuthService(BaseServiceClient):
             response = self._post("/auth/delegation/jwt", payload, token=user_token)
             data = response.json()
             
-            self.logger.debug(f"    Delegation response: {data}")
+            self.logger.debug(
+                f"    Delegation response keys: {sorted(data.keys())}"
+            )
             
             delegation_token = (
                 data.get('delegation_jwt') or
@@ -306,7 +355,14 @@ class AuthService(BaseServiceClient):
             
             if delegation_token:
                 self.logger.success("    ✅ Delegation JWT created successfully")
-                return delegation_token
+                return {
+                    "access_token": delegation_token,
+                    "refresh_token": data.get('refresh_token') or data.get('refreshToken'),
+                    "expires_in": data.get('expiry_seconds') or data.get('expires_in'),
+                    "group_id": data.get('group_id') or group_id,
+                    "chain_id": data.get('chain_id'),
+                    "raw": data,
+                }
             else:
                 self.logger.error("    ❌ Failed to create delegation JWT")
                 self.logger.warning(f"    Response: {data}")
@@ -315,6 +371,16 @@ class AuthService(BaseServiceClient):
         except Exception as e:
             self.logger.error(f"    ❌ Failed to create delegation JWT: {e}")
             return None
+
+    def create_delegation_token(
+        self,
+        user_token: str,
+        group_id: str,
+        group_name: str,
+    ) -> Optional[str]:
+        """Compatibility wrapper returning only the delegation access JWT."""
+        session = self.create_delegation_session(user_token, group_id, group_name)
+        return session.get("access_token") if session else None
     
     def login_with_group(self, email: str, password: str, group_name: str) -> Optional[str]:
         """
@@ -520,13 +586,15 @@ class AuthService(BaseServiceClient):
         name: str,
         description: str,
         group_type: str = "project",
+        *,
+        deploy: bool = False,
     ) -> dict:
         """
         POST /auth/groups — create a group as the caller identified by
         `creator_token`. The creator is the group's initial owner.
 
         Returns:
-            {"status": "created", "group_id": "..."}
+            {"status": "created", "group_id": "...", "account_activation": {...}}
             {"status": "exists"}          (HTTP 409)
             {"status": "error", "message"}
         """
@@ -535,15 +603,29 @@ class AuthService(BaseServiceClient):
         try:
             response = self.session.post(
                 f"{self.base_url}/auth/groups",
-                json={"name": name, "description": description, "group_type": group_type},
+                json={
+                    "name": name,
+                    "description": description,
+                    "group_type": group_type,
+                    # Setup owns the chain-qualified lazy activation lifecycle.
+                    # Keeping create off-chain avoids holding this request open
+                    # while a public-chain DeployAccount transaction settles.
+                    "deploy": deploy,
+                },
                 headers={
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {creator_token}",
                 },
                 timeout=self.config.request_timeout,
             )
-            if response.status_code == 200:
-                return {"status": "created", "group_id": response.json().get("id")}
+            if response.status_code in (200, 202):
+                data = response.json()
+                return {
+                    "status": "created",
+                    "group_id": data.get("id"),
+                    "account_activation": data.get("account_activation"),
+                    "http_status": response.status_code,
+                }
             if response.status_code == 409:
                 return {"status": "exists"}
             return {
@@ -555,7 +637,7 @@ class AuthService(BaseServiceClient):
 
     def add_group_member(
         self,
-        admin_token: str,
+        actor_token: str,
         group_id: str,
         user_id: str,
         role: str,
@@ -582,7 +664,7 @@ class AuthService(BaseServiceClient):
                 json={"user_id": user_id, "role": role},
                 headers={
                     "Content-Type": "application/json",
-                    "Authorization": f"Bearer {admin_token}",
+                    "Authorization": f"Bearer {actor_token}",
                 },
                 timeout=self.config.request_timeout,
             )
@@ -654,6 +736,91 @@ class AuthService(BaseServiceClient):
         except Exception as e:
             self.logger.debug(f"get_user_chain_accounts failed: {e}")
             return []
+
+    def activate_chain_account(
+        self, token: str, entity_kind: str, entity_id: str, chain_id: str
+    ) -> dict:
+        """Start or reconcile one explicit per-chain smart-account activation.
+
+        The endpoint is idempotent within its durable attempt. Callers may
+        safely re-POST while it reports ``provisioning``; a terminal retryable
+        failure advances to a new attempt on the next POST.
+        """
+        try:
+            response = self._post(
+                f"/entities/{entity_kind}/{entity_id}/chain-accounts/{chain_id}/activation",
+                {},
+                token=token,
+                timeout=330,
+            )
+            data = response.json()
+            return data if isinstance(data, dict) else {}
+        except Exception as e:
+            response = getattr(e, "response", None)
+            if response is not None:
+                try:
+                    data = response.json()
+                    if isinstance(data, dict):
+                        return data
+                except Exception:
+                    pass
+            self.logger.error(
+                f"activate_chain_account({entity_kind}, {chain_id}) failed: {e}"
+            )
+            return {}
+
+    def get_chain_account_activation(
+        self, token: str, entity_kind: str, entity_id: str, chain_id: str
+    ) -> dict:
+        """Read one activation resource without advancing its attempt."""
+        try:
+            response = self._get(
+                f"/entities/{entity_kind}/{entity_id}/chain-accounts/{chain_id}/activation",
+                token=token,
+            )
+            data = response.json()
+            return data if isinstance(data, dict) else {}
+        except Exception as e:
+            self.logger.debug(
+                f"get_chain_account_activation({entity_kind}, {chain_id}) failed: {e}"
+            )
+            return {}
+
+    def wait_for_chain_account_activation(
+        self,
+        token: str,
+        entity_kind: str,
+        entity_id: str,
+        chain_id: str,
+        *,
+        attempts: int = 12,
+        interval: float = 2.0,
+    ) -> dict:
+        """Activate and wait for auth-side readiness.
+
+        GET supplies the normal polling cadence. Every third observation
+        re-POSTs so auth can reconcile an MQ execution that completed after an
+        ambiguous handoff; a terminal failure is re-POSTed immediately to
+        allocate its next durable attempt.
+        """
+        state = self.activate_chain_account(
+            token, entity_kind, entity_id, str(chain_id)
+        )
+        for observation in range(max(1, attempts)):
+            if state.get("status") == "ready":
+                return state
+            if observation >= attempts - 1:
+                break
+            time.sleep(interval)
+            if state.get("status") == "failed_retryable" or observation % 3 == 2:
+                state = self.activate_chain_account(
+                    token, entity_kind, entity_id, str(chain_id)
+                )
+            else:
+                state = self.get_chain_account_activation(
+                    token, entity_kind, entity_id, str(chain_id)
+                )
+        return state
 
     def sign_vault(
         self,
@@ -836,9 +1003,12 @@ class AuthService(BaseServiceClient):
 
     def deploy_group_account(self, token: str, group_id: str) -> dict:
         """
-        POST /auth/groups/{id}/deploy-account — deploy the group's
-        on-chain account. Safe to call only when status is "not_deployed";
-        callers should check `group_account_status` first.
+        Compatibility wrapper for POST /auth/groups/{id}/deploy-account.
+
+        New callers should use ``wait_for_chain_account_activation`` with
+        entity kind ``group`` and an explicit JWT-selected chain. The legacy
+        route delegates to that lifecycle but cannot expose chain context in
+        its URL.
         """
         self.logger.info(f"  🚀 deploy_group_account group={group_id[:8]}...")
         try:

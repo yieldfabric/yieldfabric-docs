@@ -122,15 +122,17 @@ login_with_services() {
 }
 
 # ── Deployed account-address reporting ──────────────────────────────────
-# Account deployment is async (MQ). A user's default account is deployed on
-# first login (auth `ensure_account_deployment_for_auth`); a group's account is
-# deployed on creation (`create_group_with_deployment`). We poll the read
-# endpoints until the on-chain CREATE2 address appears, then print it. Because
-# the salt is deterministic, a fresh chain yields the SAME address every run.
+# Login is intentionally off-chain. Setup explicitly activates each user's
+# JWT-selected chain because later phases fund/use those accounts. Group
+# creation retains its existing explicit deployment lifecycle.
+
+jwt_default_chain_id() {
+    python3 -c 'import base64,json,sys; p=sys.argv[1].split(".")[1]; p += "=" * (-len(p) % 4); print(json.loads(base64.urlsafe_b64decode(p)).get("default_chain_id", ""))' "$1" 2>/dev/null
+}
 
 # Print a USER's deployed default account address.
-# Logs in as the user (this ALSO triggers the deploy) and reads with their OWN
-# token — the chain-accounts endpoint forbids reading another user's accounts.
+# Logs in as the user and explicitly activates the active chain with their OWN
+# token — activation forbids preparing another user's account.
 print_user_account_address() {
     local user_id="$1" email="$2" password="$3"
     local token
@@ -139,40 +141,72 @@ print_user_account_address() {
         echo_with_color $YELLOW "      🏦 account: (login failed; cannot read address)"
         return 1
     fi
-    local attempt resp addr chain
-    for ((attempt=1; attempt<=12; attempt++)); do
-        resp=$(curl -s -X GET "${AUTH_SERVICE_URL}/entities/user/${user_id}/chain-accounts" \
-            -H "Authorization: Bearer ${token}")
-        # Prefer the default wallet; fall back to the first with a real address.
-        addr=$(echo "$resp" | jq -r '(map(select(.is_default==true)) + .) | map(select(.account_address!=null and .account_address!="")) | .[0].account_address // empty' 2>/dev/null)
-        chain=$(echo "$resp" | jq -r '(map(select(.is_default==true)) + .) | map(select(.account_address!=null and .account_address!="")) | .[0].chain_id // empty' 2>/dev/null)
+    local chain
+    chain=$(jwt_default_chain_id "$token")
+    if [[ -z "$chain" || "$chain" == "null" ]]; then
+        echo_with_color $YELLOW "      🏦 account: (session has no active chain)"
+        return 1
+    fi
+
+    local attempt resp addr status
+    resp=$(curl -s -X POST "${AUTH_SERVICE_URL}/entities/user/${user_id}/chain-accounts/${chain}/activation" \
+        -H "Content-Type: application/json" \
+        -d '{}' \
+        -H "Authorization: Bearer ${token}")
+    for ((attempt=1; attempt<=60; attempt++)); do
+        status=$(echo "$resp" | jq -r '.status // empty' 2>/dev/null)
+        addr=$(echo "$resp" | jq -r '.account_address // empty' 2>/dev/null)
         if [[ -n "$addr" && "$addr" != "null" ]]; then
             echo_with_color $PURPLE "      🏦 account: ${addr} (chain ${chain})"
             return 0
         fi
+        if [[ "$status" == "failed_retryable" ]]; then
+            local activation_error
+            activation_error=$(echo "$resp" | jq -r '.error // "unknown error"' 2>/dev/null)
+            echo_with_color $YELLOW "      🏦 activation failed; retrying: ${activation_error}"
+        fi
+        [[ "$attempt" -ge 60 ]] && break
         sleep 2
+        # Poll with GET normally. Re-POST terminal failures immediately and
+        # every third observation so auth can reconcile a completed MQ message
+        # whose original response was ambiguous.
+        if [[ "$status" == "failed_retryable" || $((attempt % 3)) -eq 0 ]]; then
+            resp=$(curl -s -X POST "${AUTH_SERVICE_URL}/entities/user/${user_id}/chain-accounts/${chain}/activation" \
+                -H "Content-Type: application/json" \
+                -d '{}' \
+                -H "Authorization: Bearer ${token}")
+        else
+            resp=$(curl -s -X GET "${AUTH_SERVICE_URL}/entities/user/${user_id}/chain-accounts/${chain}/activation" \
+                -H "Authorization: Bearer ${token}")
+        fi
     done
-    echo_with_color $YELLOW "      🏦 account: (not on chain yet after ~24s)"
+    echo_with_color $YELLOW "      🏦 account: (not on chain yet after ~120s of reconciliation)"
     return 1
 }
 
-# Print a GROUP's deployed account address (owner/admin token required — the
-# group creator's token works).
+# Print a GROUP's account from the canonical chain-qualified activation
+# resource. The creator's owner token is required.
 print_group_account_address() {
     local group_id="$1" token="$2"
+    local chain
+    chain=$(jwt_default_chain_id "$token")
+    if [[ -z "$chain" || "$chain" == "null" ]]; then
+        echo_with_color $YELLOW "      🏦 account: (session has no active chain)"
+        return 1
+    fi
     local attempt resp addr status
-    for ((attempt=1; attempt<=12; attempt++)); do
-        resp=$(curl -s -X GET "${AUTH_SERVICE_URL}/auth/groups/${group_id}/account-status" \
+    for ((attempt=1; attempt<=60; attempt++)); do
+        resp=$(curl -s -X GET "${AUTH_SERVICE_URL}/entities/group/${group_id}/chain-accounts/${chain}/activation" \
             -H "Authorization: Bearer ${token}")
-        status=$(echo "$resp" | jq -r '.account_status.status // empty' 2>/dev/null)
-        addr=$(echo "$resp" | jq -r '.account_status.account_address // empty' 2>/dev/null)
+        status=$(echo "$resp" | jq -r '.status // empty' 2>/dev/null)
+        addr=$(echo "$resp" | jq -r '.account_address // empty' 2>/dev/null)
         if [[ -n "$addr" && "$addr" != "null" && "$addr" != "0x0000000000000000000000000000000000000000" ]]; then
-            echo_with_color $PURPLE "      🏦 account: ${addr}${status:+ (${status})}"
+            echo_with_color $PURPLE "      🏦 account: ${addr} (chain ${chain}${status:+, ${status}})"
             return 0
         fi
-        sleep 2
+        [[ "$attempt" -lt 60 ]] && sleep 2
     done
-    echo_with_color $YELLOW "      🏦 account: (not on chain yet after ~24s)"
+    echo_with_color $YELLOW "      🏦 account: (not on chain yet after ~120s of reconciliation)"
     return 1
 }
 
@@ -451,8 +485,11 @@ create_initial_users() {
                 echo_with_color $YELLOW "  📧 $email - ⚠️  Already exists (ID: ${existing_user_id:0:8}...)"
                 # Store user ID for later use
                 eval "USER_ID_${i}=\"$existing_user_id\""
-                success_count=$((success_count + 1))
-                print_user_account_address "$existing_user_id" "$email" "$password"
+                if print_user_account_address "$existing_user_id" "$email" "$password"; then
+                    success_count=$((success_count + 1))
+                else
+                    echo_with_color $RED "  📧 $email - ❌ Account activation did not become ready"
+                fi
                 continue
             fi
             
@@ -476,11 +513,14 @@ create_initial_users() {
                     echo_with_color $GREEN "  📧 $email - ✅ Created (ID: ${user_id:0:8}...)"
                     # Store user ID for later use
                     eval "USER_ID_${i}=\"$user_id\""
-                    success_count=$((success_count + 1))
                     # Wait a moment for the user to be fully registered
                     sleep 2
-                    # Trigger deploy (via login) + print the deployed account address
-                    print_user_account_address "$user_id" "$email" "$password"
+                    # Explicitly activate the setup chain and print the account address.
+                    if print_user_account_address "$user_id" "$email" "$password"; then
+                        success_count=$((success_count + 1))
+                    else
+                        echo_with_color $RED "  📧 $email - ❌ Account activation did not become ready"
+                    fi
                 else
                     echo_with_color $RED "  📧 $email - ❌ Failed: invalid response"
                 fi
@@ -520,10 +560,13 @@ create_group() {
     local http_status=$(echo "$http_response" | grep -o 'HTTP_STATUS:[0-9]*' | cut -d: -f2)
     local response_body=$(echo "$http_response" | sed 's/HTTP_STATUS:[0-9]*//')
     
-    if [[ "$http_status" == "200" ]]; then
+    if [[ "$http_status" == "200" || "$http_status" == "202" ]]; then
         local created_group_id=$(echo "$response_body" | jq -r '.id // empty' 2>/dev/null)
         if [[ -n "$created_group_id" && "$created_group_id" != "null" ]]; then
             echo_with_color $GREEN "    ✅ Created (ID: ${created_group_id:0:8}...)"
+            if ! deploy_group_account_if_needed "$created_group_id" "$creator_token"; then
+                return 1
+            fi
             print_group_account_address "$created_group_id" "$creator_token"
             return 0
         else
@@ -534,6 +577,9 @@ create_group() {
         echo_with_color $YELLOW "    ⚠️  Already exists"
         local existing_gid=$(get_group_id_by_name_for_delegation "$creator_token" "$name")
         if [[ -n "$existing_gid" && "$existing_gid" != "null" ]]; then
+            if ! deploy_group_account_if_needed "$existing_gid" "$creator_token"; then
+                return 1
+            fi
             print_group_account_address "$existing_gid" "$creator_token"
         fi
         return 0
@@ -977,7 +1023,13 @@ setup_users() {
         if [[ -n "$email" && -n "$password" && -n "$role" ]]; then
             total_count=$((total_count + 1))
             if create_user "$email" "$password" "$role" "$admin_token"; then
-                success_count=$((success_count + 1))
+                local user_id
+                user_id=$(check_user_exists "$email")
+                if [[ -n "$user_id" ]] && print_user_account_address "$user_id" "$email" "$password"; then
+                    success_count=$((success_count + 1))
+                else
+                    echo_with_color $RED "  ❌ $email account activation did not become ready"
+                fi
             fi
         else
             echo_with_color $RED "Invalid user data at index $i"
@@ -1049,59 +1101,57 @@ setup_groups() {
     return $((success_count == total_count ? 0 : 1))
 }
 
-# Function to deploy group account if not already deployed
+# Explicitly activate a group account on the creator JWT's selected chain.
+# POST is idempotent within a durable attempt; GET is the normal poll, while a
+# periodic POST lets auth reconcile an ambiguous MQ handoff.
 deploy_group_account_if_needed() {
     local group_id="$1"
-    local admin_token="$2"
-    
-    echo_with_color $BLUE "    🔍 Checking account status for group ID: $group_id"
-    
-    # Check if group account is already deployed
-    local account_status_response=$(curl -s -X GET "${AUTH_SERVICE_URL}/auth/groups/$group_id/account-status" \
-        -H "Authorization: Bearer $admin_token")
-    
-    if [[ -n "$account_status_response" ]]; then
-        echo_with_color $BLUE "    📥 Account status response: $account_status_response"
-        local status=$(echo "$account_status_response" | jq -r '.account_status.status // empty' 2>/dev/null)
-        echo_with_color $BLUE "    📊 Parsed status: '$status'"
-        
-        if [[ "$status" == "deployed" ]]; then
-            echo_with_color $GREEN "    ✅ Group account already deployed"
-            return 0
-        elif [[ "$status" == "not_deployed" ]]; then
-            echo_with_color $BLUE "    🚀 Deploying group account..."
-            
-            # Deploy the group account
-            local deploy_response=$(curl -s -w "HTTP_STATUS:%{http_code}" -X POST "${AUTH_SERVICE_URL}/auth/groups/$group_id/deploy-account" \
-                -H "Authorization: Bearer $admin_token")
-            
-            local http_status=$(echo "$deploy_response" | grep -o 'HTTP_STATUS:[0-9]*' | cut -d: -f2)
-            local response_body=$(echo "$deploy_response" | sed 's/HTTP_STATUS:[0-9]*//')
-            
-            if [[ "$http_status" == "200" ]]; then
-                local success=$(echo "$response_body" | jq -r '.status // empty' 2>/dev/null)
-                if [[ "$success" == "success" ]]; then
-                    echo_with_color $GREEN "    ✅ Group account deployment initiated"
-                    # Wait a moment for deployment to complete
-                    sleep 3
-                    return 0
-                else
-                    echo_with_color $YELLOW "    ⚠️  Group account deployment initiated"
-                    sleep 3
-                    return 0
-                fi
-            else
-                echo_with_color $RED "    ❌ Failed to deploy group account (HTTP $http_status)"
-                return 1
-            fi
-        else
-            echo_with_color $YELLOW "    ⚠️  Unknown account status: $status"
-            return 0
-        fi
-    else
-        echo_with_color $RED "    ❌ Failed to get group account status"
+    local creator_token="$2"
+    local chain
+    chain=$(jwt_default_chain_id "$creator_token")
+    if [[ -z "$chain" || "$chain" == "null" ]]; then
+        echo_with_color $RED "    ❌ Creator session has no active chain"
         return 1
     fi
+
+    local url="${AUTH_SERVICE_URL}/entities/group/${group_id}/chain-accounts/${chain}/activation"
+    local resp status addr activation_error attempt
+    echo_with_color $BLUE "    🚀 Activating group account on chain ${chain}..."
+    resp=$(curl -s -X POST "$url" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer ${creator_token}" \
+        -d '{}')
+
+    for ((attempt=1; attempt<=60; attempt++)); do
+        status=$(echo "$resp" | jq -r '.status // empty' 2>/dev/null)
+        addr=$(echo "$resp" | jq -r '.account_address // empty' 2>/dev/null)
+        if [[ "$status" == "ready" && -n "$addr" && "$addr" != "null" ]]; then
+            echo_with_color $GREEN "    ✅ Group account ready: ${addr}"
+            return 0
+        fi
+        if [[ "$status" == "pending_signature" ]]; then
+            echo_with_color $YELLOW "    ⚠️  Group activation awaits a wallet signature"
+            return 1
+        fi
+        if [[ "$status" == "failed_retryable" ]]; then
+            activation_error=$(echo "$resp" | jq -r '.error // "unknown error"' 2>/dev/null)
+            echo_with_color $YELLOW "    ⚠️  Activation failed; retrying: ${activation_error}"
+        fi
+        [[ "$attempt" -ge 60 ]] && break
+        sleep 2
+        if [[ "$status" == "failed_retryable" || $((attempt % 3)) -eq 0 ]]; then
+            resp=$(curl -s -X POST "$url" \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer ${creator_token}" \
+                -d '{}')
+        else
+            resp=$(curl -s -X GET "$url" \
+                -H "Authorization: Bearer ${creator_token}")
+        fi
+    done
+
+    echo_with_color $RED "    ❌ Group activation did not become ready: ${resp}"
+    return 1
 }
 
 # Function to create delegation JWT for group management
@@ -1133,7 +1183,7 @@ create_delegation_jwt() {
 add_member_as_owner() {
     local group_id="$1"
     local member_email="$2"
-    local admin_token="$3"
+    local actor_token="$3"
     
     echo_with_color $BLUE "    🔍 Looking up user ID for: $member_email"
     
@@ -1151,7 +1201,7 @@ add_member_as_owner() {
     # Create delegation JWT for group management
     echo_with_color $BLUE "    🔍 DEBUG: About to create delegation JWT"
     local delegation_token
-    delegation_token=$(create_delegation_jwt "$group_id" "$admin_token")
+    delegation_token=$(create_delegation_jwt "$group_id" "$actor_token")
     local delegation_result=$?
     echo_with_color $BLUE "    🔍 DEBUG: Delegation JWT creation result: $delegation_result"
     if [[ $delegation_result -ne 0 ]]; then
@@ -1160,22 +1210,28 @@ add_member_as_owner() {
     fi
     echo_with_color $BLUE "    🔍 DEBUG: Delegation JWT created successfully: ${delegation_token:0:50}..."
     
-    echo_with_color $BLUE "    🔍 Checking account status for group ID: $group_id"
-    
-    # Get the group's account address using admin token (delegation JWT not needed for read operations)
-    local account_status_response=$(curl -s -X GET "${AUTH_SERVICE_URL}/auth/groups/$group_id/account-status" \
-        -H "Authorization: Bearer $admin_token")
+    local chain
+    chain=$(jwt_default_chain_id "$actor_token")
+    if [[ -z "$chain" || "$chain" == "null" ]]; then
+        echo_with_color $RED "    ❌ Group actor session has no active chain"
+        return 1
+    fi
+    echo_with_color $BLUE "    🔍 Checking group activation on chain $chain"
+
+    local account_status_response=$(curl -s -X GET \
+        "${AUTH_SERVICE_URL}/entities/group/${group_id}/chain-accounts/${chain}/activation" \
+        -H "Authorization: Bearer $actor_token")
     
     echo_with_color $BLUE "    📥 Account status response: $account_status_response"
     
     if [[ -n "$account_status_response" ]]; then
-        local account_address=$(echo "$account_status_response" | jq -r '.account_status.account_address // empty' 2>/dev/null)
-        local status=$(echo "$account_status_response" | jq -r '.account_status.status // empty' 2>/dev/null)
+        local account_address=$(echo "$account_status_response" | jq -r '.account_address // empty' 2>/dev/null)
+        local status=$(echo "$account_status_response" | jq -r '.status // empty' 2>/dev/null)
         
         echo_with_color $BLUE "    📊 Parsed status: '$status'"
         echo_with_color $BLUE "    📊 Parsed account_address: '$account_address'"
         
-        if [[ "$status" == "deployed" && -n "$account_address" && "$account_address" != "null" ]]; then
+        if [[ "$status" == "ready" && -n "$account_address" && "$account_address" != "null" ]]; then
             echo_with_color $BLUE "    🔑 Adding $member_email as owner to account: ${account_address:0:10}..."
             echo_with_color $BLUE "    📡 Making API call to: /auth/groups/$group_id/add-owner"
             echo_with_color $BLUE "    📦 Payload: {\"new_owner\": \"$user_id\"}"
@@ -1244,33 +1300,12 @@ setup_group_relationships() {
         
         echo_with_color $BLUE "🏢 Setting up relationships for: $group_name"
         echo_with_color $BLUE "    📋 Original group ID from YAML: '$group_id'"
-        
-        # Always resolve group id by name since YAML IDs are not UUIDs
-        echo_with_color $BLUE "    🔍 Looking up group by name to get actual UUID..."
-        local resolved_group_id=$(get_group_id_by_name "$effective_token" "$group_name")
-        echo_with_color $BLUE "    📋 Resolved group ID by name: '$resolved_group_id'"
-        if [[ -z "$resolved_group_id" || "$resolved_group_id" == "null" ]]; then
-            # Attempt to create the group quickly if it doesn't exist
-            local description=$(parse_yaml "$SETUP_FILE" ".groups[$i].description")
-            local group_type=$(parse_yaml "$SETUP_FILE" ".groups[$i].group_type")
-            if create_group "$group_id" "$group_name" "$description" "$group_type" "$effective_token"; then
-                resolved_group_id=$(get_group_id_by_name "$effective_token" "$group_name")
-            fi
-        fi
-        if [[ -z "$resolved_group_id" || "$resolved_group_id" == "null" ]]; then
-            echo_with_color $RED "❌ Could not resolve group id for: $group_name"
-            continue
-        fi
-        
-        # Ensure group account is deployed before adding owners
-        echo_with_color $BLUE "    🏦 Checking group account deployment for group ID: $resolved_group_id..."
-        deploy_group_account_if_needed "$resolved_group_id" "$effective_token"
-        
-        # Get the group creator's credentials to use their token for member operations
+
+        # The group creator is its initial owner. Use that same principal for
+        # creation, activation, and membership changes; the bootstrap/API-key
+        # token may represent a different entity.
         local creator_email=$(parse_yaml "$SETUP_FILE" ".groups[$i].user.id")
         local creator_password=$(parse_yaml "$SETUP_FILE" ".groups[$i].user.password")
-        
-        # Get token for the group creator to use for member operations
         local creator_token=""
         if [[ -n "$creator_email" && -n "$creator_password" ]]; then
             echo_with_color $BLUE "    🔑 Getting token for group creator: $creator_email"
@@ -1281,8 +1316,32 @@ setup_group_relationships() {
             fi
             echo_with_color $GREEN "    ✅ Got token for group creator: $creator_email"
         else
-            echo_with_color $YELLOW "    ⚠️  No creator specified, using admin token"
+            echo_with_color $YELLOW "    ⚠️  No creator specified, using admin principal"
             creator_token="$effective_token"
+        fi
+        
+        # Always resolve group id by name since YAML IDs are not UUIDs
+        echo_with_color $BLUE "    🔍 Looking up group by name to get actual UUID..."
+        local resolved_group_id=$(get_group_id_by_name "$effective_token" "$group_name")
+        echo_with_color $BLUE "    📋 Resolved group ID by name: '$resolved_group_id'"
+        if [[ -z "$resolved_group_id" || "$resolved_group_id" == "null" ]]; then
+            # Attempt to create the group quickly if it doesn't exist
+            local description=$(parse_yaml "$SETUP_FILE" ".groups[$i].description")
+            local group_type=$(parse_yaml "$SETUP_FILE" ".groups[$i].group_type")
+            if create_group "$group_id" "$group_name" "$description" "$group_type" "$creator_token"; then
+                resolved_group_id=$(get_group_id_by_name "$effective_token" "$group_name")
+            fi
+        fi
+        if [[ -z "$resolved_group_id" || "$resolved_group_id" == "null" ]]; then
+            echo_with_color $RED "❌ Could not resolve group id for: $group_name"
+            continue
+        fi
+        
+        # Ensure group account is deployed before adding owners
+        echo_with_color $BLUE "    🏦 Checking group account deployment for group ID: $resolved_group_id..."
+        if ! deploy_group_account_if_needed "$resolved_group_id" "$creator_token"; then
+            echo_with_color $RED "    ❌ Group account is not ready; skipping on-chain owner setup"
+            continue
         fi
         
         # Handle members with their specific roles
@@ -2048,8 +2107,8 @@ show_help() {
     echo "  • Fiat account delegation: Include user.id, user.password, and user.group for group delegation"
     echo ""
     echo "Owner Setup:"
-    echo "  • All group members are automatically added as owners to the group's account"
-    echo "  • Group accounts are automatically deployed if not already deployed"
+    echo "  • Declared group members are added with the creator's owner credential"
+    echo "  • Setup explicitly activates each group on the creator JWT's selected chain"
     echo "  • Use 'owners' command to setup only group account owners"
     echo ""
     echo "Examples:"

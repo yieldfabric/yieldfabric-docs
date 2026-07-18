@@ -143,12 +143,12 @@ class BaseExecutor:
     # ------------------------------------------------------------------
     # Event-based polling baked into every async command.
     #
-    # The pattern: every MQ-backed mutation returns `message_id`. By
-    # default, we poll the message-status endpoint until `executed` is
-    # populated before returning. That keeps YAML execution sequenced by
-    # real backend state instead of the shell harness's blanket
-    # `COMMAND_DELAY`. Callers can opt out with `parameters.wait: false`
-    # for fire-and-forget workloads.
+    # The pattern: MQ-backed mutations return `message_id`, or
+    # `message_ids` for batch work. By default, we poll every message until
+    # execution and graph post-processing complete before returning. That
+    # keeps YAML execution sequenced by real backend state instead of the
+    # shell harness's blanket `COMMAND_DELAY`. Callers can opt out with
+    # `parameters.wait: false` for fire-and-forget workloads.
     #
     # Executors call `_maybe_wait_for_execution` after a successful
     # submission and BEFORE storing final outputs. Downstream commands
@@ -238,10 +238,11 @@ class BaseExecutor:
 
         outputs["executed_at"] = result.observation.get("executed")
         outputs["execution_response"] = result.observation.get("response")
-        if isinstance(result.observation.get("response"), dict):
-            outputs["post_processed_at"] = result.observation["response"].get(
-                "post_processed_at"
-            )
+        response = result.observation.get("response")
+        post_processed_at = result.observation.get("post_processed_at")
+        if post_processed_at is None and isinstance(response, dict):
+            post_processed_at = response.get("post_processed_at")
+        outputs["post_processed_at"] = post_processed_at
         outputs["wait_attempts"] = result.attempts
         outputs["wait_elapsed"] = result.elapsed
         self.logger.success(
@@ -250,20 +251,91 @@ class BaseExecutor:
         )
         return self._message_execution_error(result.observation)
 
+    @staticmethod
+    def _normalize_message_ids(message_ids) -> list:
+        """Return distinct, non-empty message IDs in response order."""
+        distinct_ids = []
+        seen = set()
+        for message_id in message_ids or []:
+            if not isinstance(message_id, str):
+                continue
+            message_id = message_id.strip()
+            if not message_id or message_id in seen:
+                continue
+            seen.add(message_id)
+            distinct_ids.append(message_id)
+        return distinct_ids
+
+    def _maybe_wait_for_executions(
+        self,
+        command: Command,
+        token: str,
+        message_ids: list,
+        outputs: dict,
+    ) -> Optional[str]:
+        """Wait for every distinct message produced by a batch mutation.
+
+        Batch APIs such as ``acceptAll`` return one MQ message per accepted
+        payment. Treating the synchronous GraphQL response as settlement lets
+        the next YAML command race chain execution and graph projection. Apply
+        the single-message completion contract to every child and retain
+        per-message diagnostics in ``message_waits``.
+        """
+        if not self._should_wait(command):
+            return None
+
+        distinct_ids = self._normalize_message_ids(message_ids)
+
+        if not distinct_ids:
+            if self._wait_was_explicit(command):
+                self.logger.warning(
+                    "  ⚠️  wait requested but the batch command did not return "
+                    "any message_ids; nothing to poll"
+                )
+            return None
+
+        waits = []
+        errors = []
+        for message_id in distinct_ids:
+            wait_output = {"message_id": message_id}
+            error = self._maybe_wait_for_execution(
+                command, token, message_id, wait_output
+            )
+            waits.append(wait_output)
+            if error:
+                errors.append(f"{message_id}: {error}")
+
+        outputs["message_waits"] = waits
+        outputs["wait_attempts"] = sum(
+            int(item.get("wait_attempts") or 0) for item in waits
+        )
+        outputs["wait_elapsed"] = sum(
+            float(item.get("wait_elapsed") or 0.0) for item in waits
+        )
+        if any(item.get("wait_timed_out") for item in waits):
+            outputs["wait_timed_out"] = True
+
+        return "; ".join(errors) if errors else None
+
     def _message_execution_error(self, observation: dict) -> Optional[str]:
-        """Return an error message when the final MQ response is failed."""
+        """Return an error message when the final MQ response is unsuccessful."""
         response = observation.get("response")
         if not isinstance(response, dict):
             return None
 
         status = str(response.get("status") or "").lower()
         success = response.get("success")
-        if success is False or status in {"failed", "error"}:
+        error = response.get("error")
+        if success is False or status in {"failed", "error", "canceled"} or error:
             return (
-                response.get("error")
+                error
                 or response.get("error_message")
                 or response.get("message")
-                or "message execution failed"
+                or (
+                    "message execution canceled"
+                    if status == "canceled"
+                    else "message execution failed"
+                )
             )
         return None
 
@@ -355,9 +427,15 @@ class BaseExecutor:
             4. log_command_success.
             5. Wrap in CommandResponse.success_response.
         """
-        wait_error = self._maybe_wait_for_execution(
-            command, token, outputs.get("message_id"), outputs
-        )
+        message_ids = outputs.get("message_ids")
+        if isinstance(message_ids, (list, tuple, set)):
+            wait_error = self._maybe_wait_for_executions(
+                command, token, list(message_ids), outputs
+            )
+        else:
+            wait_error = self._maybe_wait_for_execution(
+                command, token, outputs.get("message_id"), outputs
+            )
         self.store_outputs(command.name, outputs)
         if wait_error:
             self.logger.error(f"    ❌ Message execution failed: {wait_error}")

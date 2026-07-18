@@ -98,7 +98,7 @@ def test_user_token_falls_back_to_login_when_refresh_token_was_rotated_elsewhere
     assert auth.login_session.call_count == 2
 
 
-def test_refresh_token_lookup_only_matches_user_access_token():
+def test_refresh_token_lookup_returns_the_token_paired_with_each_access_token():
     auth = MagicMock()
     user_token = _jwt({"sub": "user-1", "exp": 2000, "chain_id": "31337"})
     delegation_token = _jwt({
@@ -112,17 +112,25 @@ def test_refresh_token_lookup_only_matches_user_access_token():
         "expires_in": 1000,
     }
     auth.get_group_id_by_name.return_value = "group-1"
-    auth.create_delegation_token.return_value = delegation_token
+    auth.create_delegation_session.return_value = {
+        "access_token": delegation_token,
+        "refresh_token": "delegation-refresh-1",
+        "expires_in": 1000,
+        "chain_id": "31337",
+    }
 
     manager = TokenManager(auth, _config(), now=lambda: 1000.0)
 
     assert manager.get_user_token("u@example.com", "pw") == user_token
     assert manager.get_delegation_token("u@example.com", "pw", "Issuer Group") == delegation_token
     assert manager.refresh_token_for_access_token(user_token) == "refresh-1"
-    assert manager.refresh_token_for_access_token(delegation_token) is None
+    assert (
+        manager.refresh_token_for_access_token(delegation_token)
+        == "delegation-refresh-1"
+    )
 
 
-def test_group_delegation_renews_without_second_password_login_or_group_lookup():
+def test_group_delegation_rotates_its_own_refresh_token():
     auth = MagicMock()
     user_token = _jwt({"sub": "user-1", "exp": 2000, "chain_id": "31337"})
     first_delegation = _jwt({
@@ -141,7 +149,17 @@ def test_group_delegation_renews_without_second_password_login_or_group_lookup()
         "expires_in": 1000,
     }
     auth.get_group_id_by_name.return_value = "group-1"
-    auth.create_delegation_token.side_effect = [first_delegation, second_delegation]
+    auth.create_delegation_session.return_value = {
+        "access_token": first_delegation,
+        "refresh_token": "delegation-refresh-1",
+        "expires_in": 2,
+        "chain_id": "31337",
+    }
+    auth.refresh_access_token.return_value = {
+        "access_token": second_delegation,
+        "refresh_token": "delegation-refresh-2",
+        "expires_in": 998,
+    }
 
     now = [1000.0]
     manager = TokenManager(auth, _config(), now=lambda: now[0])
@@ -152,7 +170,102 @@ def test_group_delegation_renews_without_second_password_login_or_group_lookup()
 
     auth.login_session.assert_called_once_with("u@example.com", "pw")
     auth.get_group_id_by_name.assert_called_once_with(user_token, "Issuer Group")
-    assert auth.create_delegation_token.call_count == 2
+    auth.create_delegation_session.assert_called_once_with(
+        user_token, "group-1", "Issuer Group"
+    )
+    auth.refresh_access_token.assert_called_once_with(
+        "delegation-refresh-1", chain_id="31337"
+    )
+    assert (
+        manager.refresh_token_for_access_token(second_delegation)
+        == "delegation-refresh-2"
+    )
+
+
+def test_rejected_delegation_refresh_mints_a_fresh_delegation():
+    auth = MagicMock()
+    user_token = _jwt({"sub": "user-1", "exp": 2000, "chain_id": "31337"})
+    first_delegation = _jwt({
+        "sub": "user-1",
+        "acting_as": "group-1",
+        "exp": 1002,
+    })
+    second_delegation = _jwt({
+        "sub": "user-1",
+        "acting_as": "group-1",
+        "exp": 2000,
+    })
+    auth.login_session.return_value = {
+        "access_token": user_token,
+        "refresh_token": "user-refresh-1",
+        "expires_in": 1000,
+    }
+    auth.get_group_id_by_name.return_value = "group-1"
+    auth.create_delegation_session.side_effect = [
+        {
+            "access_token": first_delegation,
+            "refresh_token": "delegation-refresh-1",
+            "expires_in": 2,
+            "chain_id": "31337",
+        },
+        {
+            "access_token": second_delegation,
+            "refresh_token": "delegation-refresh-2",
+            "expires_in": 998,
+            "chain_id": "31337",
+        },
+    ]
+    auth.refresh_access_token.return_value = None
+
+    now = [1000.0]
+    manager = TokenManager(auth, _config(), now=lambda: now[0])
+
+    assert manager.get_delegation_token(
+        "u@example.com", "pw", "Issuer Group"
+    ) == first_delegation
+    now[0] = 1001.6
+    assert manager.get_delegation_token(
+        "u@example.com", "pw", "Issuer Group"
+    ) == second_delegation
+
+    auth.login_session.assert_called_once_with("u@example.com", "pw")
+    auth.get_group_id_by_name.assert_called_once_with(user_token, "Issuer Group")
+    assert auth.create_delegation_session.call_count == 2
+    auth.refresh_access_token.assert_called_once_with(
+        "delegation-refresh-1", chain_id="31337"
+    )
+
+
+def test_legacy_auth_client_without_session_api_still_mints_delegation_token():
+    auth = MagicMock(spec=[
+        "login_session",
+        "get_group_id_by_name",
+        "create_delegation_token",
+        "refresh_access_token",
+    ])
+    user_token = _jwt({"sub": "user-1", "exp": 2000, "chain_id": "31337"})
+    delegation_token = _jwt({
+        "sub": "user-1",
+        "acting_as": "group-1",
+        "exp": 2000,
+    })
+    auth.login_session.return_value = {
+        "access_token": user_token,
+        "refresh_token": "user-refresh-1",
+        "expires_in": 1000,
+    }
+    auth.get_group_id_by_name.return_value = "group-1"
+    auth.create_delegation_token.return_value = delegation_token
+
+    manager = TokenManager(auth, _config(), now=lambda: 1000.0)
+
+    assert manager.get_delegation_token(
+        "u@example.com", "pw", "Issuer Group"
+    ) == delegation_token
+    auth.create_delegation_token.assert_called_once_with(
+        user_token, "group-1", "Issuer Group"
+    )
+    assert manager.refresh_token_for_access_token(delegation_token) is None
 
 
 def test_message_poll_resolves_token_supplier_for_each_probe():

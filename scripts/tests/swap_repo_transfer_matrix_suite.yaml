@@ -97,15 +97,9 @@ commands:
   - name: t1_original_lender_claim_fails
     type: accept
     user: { id: investor@yieldfabric.com, password: investor_password }
-    # NO expect_error ON PURPOSE. The run revealed the platform rejects a non-payee only INCIDENTALLY,
-    # via the on-chain ZK balance proof (utils/Vault.sol:565 "Initial amounts don't match") — the SAME
-    # generic revert a BROKEN retrieve produces (cf. the #71/#75 bugs). Pinning that string would
-    # conflate "non-payee correctly rejected" with "retrieve regressed", so a future bug could pass this
-    # negative for the wrong reason — a false signal. The AUTHORITATIVE proof that routing is correct is
-    # the balance pair below: t1_assert_cash_to_new_holder (issuer +1050) AND
-    # t1_assert_no_cash_to_original_lender (investor +0).
-    # PLATFORM FINDING (separate): `accept` has no explicit payee-authorization check — the clean
-    # "You are not the owner" gate at utils/Vault.sol:572 is never reached because :565 fails first.
+    # The resolver now proves that the selected-chain payee wallet belongs to
+    # the effective entity before signing or acquiring the durable retrieve
+    # claim. The balance pair below remains the end-to-end routing proof.
     parameters: { payment_id: PAY-REPURCHASE-890001-0, idempotency_key: t1-orig-claim-$(date +%s), expect_failure: true }
   # POSITIVE: the NEW holder (issuer) claims the repurchase cash
   - name: t1_new_holder_claim

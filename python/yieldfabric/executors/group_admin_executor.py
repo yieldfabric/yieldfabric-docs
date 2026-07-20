@@ -114,6 +114,81 @@ class GroupAdminExecutor(BaseExecutor):
             command.name, command.type, [message]
         )
 
+    @staticmethod
+    def _mutation_was_accepted(result: dict) -> bool:
+        """Accept both the legacy synchronous and durable operation shapes."""
+        if result.get("status") == "success":
+            return True
+        return result.get("success") is True and result.get("status") not in {
+            "failed",
+            "retry_required",
+            "error",
+        }
+
+    def _settle_group_account_operation(
+        self,
+        command: Command,
+        token: str,
+        group_id: str,
+        result: dict,
+    ) -> dict:
+        """Wait for auth's durable group mutation unless YAML opts out."""
+        if not self._mutation_was_accepted(result):
+            return result
+
+        # Compatibility with the former synchronous response and explicit
+        # fire-and-forget commands.
+        operation_id = result.get("operation_id")
+        if not operation_id or not self._should_wait(command):
+            return result
+        if result.get("status") == "confirmed":
+            return result
+
+        timeout = self._float_param(
+            command, "wait_timeout", self._DEFAULT_WAIT_TIMEOUT_SEC
+        )
+        interval = self._float_param(
+            command, "wait_interval", self._DEFAULT_WAIT_INTERVAL_SEC
+        )
+        deadline = time.monotonic() + timeout
+        attempts = 0
+        latest = result
+        self.logger.info(
+            f"  ⏳ polling group account operation {str(operation_id)[:8]}... "
+            f"(interval={interval}s, timeout={timeout}s)"
+        )
+
+        while True:
+            status = str(latest.get("status") or "").lower()
+            if status == "confirmed":
+                latest["wait_attempts"] = attempts
+                self.logger.success(
+                    f"    ✅ group account operation {str(operation_id)[:8]}... confirmed"
+                )
+                return latest
+            if status in {"failed", "retry_required"} or latest.get("success") is False:
+                return latest
+            if time.monotonic() >= deadline:
+                return {
+                    **latest,
+                    "status": "error",
+                    "success": False,
+                    "message": (
+                        f"Timed out waiting for group account operation "
+                        f"{operation_id} after {timeout}s"
+                    ),
+                    "wait_timed_out": True,
+                    "wait_attempts": attempts,
+                }
+
+            time.sleep(interval)
+            attempts += 1
+            observed = self.auth_service.get_group_account_operation(
+                token, group_id, str(operation_id)
+            )
+            if isinstance(observed, dict):
+                latest = observed
+
     # ------------------------------------------------------------------
     # add_owner / remove_owner
     # ------------------------------------------------------------------
@@ -133,11 +208,20 @@ class GroupAdminExecutor(BaseExecutor):
         self.log_parameters({"group": command.user.group, "new_owner": new_owner})
 
         result = self.auth_service.add_group_owner(token, group_id, new_owner)
-        if result.get("status") != "success":
+        result = self._settle_group_account_operation(
+            command, token, group_id, result
+        )
+        if not self._mutation_was_accepted(result):
             return self._finalize_rest_error(command, result, fallback="add_owner failed")
         return self._finalize_rest_success(
             command,
-            {"group_id": group_id, "new_owner": new_owner},
+            {
+                "group_id": group_id,
+                "new_owner": new_owner,
+                "operation_id": result.get("operation_id"),
+                "message_id": result.get("message_id"),
+                "operation_status": result.get("status"),
+            },
             success_message=f"add_owner: {new_owner} added to {command.user.group}",
         )
 
@@ -156,11 +240,20 @@ class GroupAdminExecutor(BaseExecutor):
         self.log_parameters({"group": command.user.group, "old_owner": old_owner})
 
         result = self.auth_service.remove_group_owner(token, group_id, old_owner)
-        if result.get("status") != "success":
+        result = self._settle_group_account_operation(
+            command, token, group_id, result
+        )
+        if not self._mutation_was_accepted(result):
             return self._finalize_rest_error(command, result, fallback="remove_owner failed")
         return self._finalize_rest_success(
             command,
-            {"group_id": group_id, "old_owner": old_owner},
+            {
+                "group_id": group_id,
+                "old_owner": old_owner,
+                "operation_id": result.get("operation_id"),
+                "message_id": result.get("message_id"),
+                "operation_status": result.get("status"),
+            },
             success_message=f"remove_owner: {old_owner} removed from {command.user.group}",
         )
 
@@ -241,7 +334,7 @@ class GroupAdminExecutor(BaseExecutor):
                     token, group_id, obligation_id, obligation_address
                 )
 
-            if result.get("status") == "success":
+            if self._mutation_was_accepted(result):
                 break
 
             message = str(result.get("message") or result.get("error") or "")
@@ -258,7 +351,10 @@ class GroupAdminExecutor(BaseExecutor):
             )
             time.sleep(self._ACCOUNT_MEMBER_RESOLVE_RETRY_SECONDS)
 
-        if result.get("status") != "success":
+        result = self._settle_group_account_operation(
+            command, token, group_id, result
+        )
+        if not self._mutation_was_accepted(result):
             return self._finalize_rest_error(
                 command, result, fallback=f"{command.type} failed"
             )
@@ -268,6 +364,9 @@ class GroupAdminExecutor(BaseExecutor):
                 "group_id": group_id,
                 "obligation_id": obligation_id,
                 "obligation_address": obligation_address,
+                "operation_id": result.get("operation_id"),
+                "message_id": result.get("message_id"),
+                "operation_status": result.get("status"),
             },
             success_message=f"{command.type} ok",
         )

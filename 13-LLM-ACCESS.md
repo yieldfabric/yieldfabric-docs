@@ -140,9 +140,14 @@ curl https://agents.yieldfabric.com/api/models \
 # → { "data": [
 #      {"id": "default", "model": "gpt-5.2", "kind": "chat", "aliases": ["gpt-5.2"], "default": true},
 #      {"id": "mini", "model": "gpt-5.4-mini", "kind": "chat", "aliases": ["gpt-5.4-mini"], "default": false},
-#      {"id": "embedding", "model": "text-embedding-ada-002", "kind": "embedding", "aliases": ["text-embedding-ada-002"], "default": false}
+#      {"id": "embedding", "model": "text-embedding-3-large", "kind": "embedding", "aliases": ["text-embedding-3-large", "text-embedding-ada-002"], "default": false}
 #    ] }
 ```
+
+The Azure embedding deployment returns fixed 1,536-element vectors from
+`text-embedding-3-large`. The old `text-embedding-ada-002` name remains a
+deprecated routing alias so existing SDK calls keep working; responses and
+usage records report the actual deployment.
 
 Pass an entry's `id` (or any alias) as `model` on `POST /chat` —
 `"mini"` is the cheap-and-fast choice for classification, drafts,

@@ -179,3 +179,63 @@ def test_create_group_is_off_chain_before_explicit_activation():
         },
         timeout=30,
     )
+
+
+def test_group_account_mutations_assert_the_jwt_chain():
+    service = AuthService(_config())
+    token = _jwt({"sub": "user-1", "default_chain_id": "31337"})
+    service._post = MagicMock(
+        return_value=_response({"success": True, "status": "confirmed"})
+    )
+
+    service.add_group_owner(token, "group-1", "owner-1")
+    service.remove_group_owner(token, "group-1", "0x" + "11" * 20)
+    service.add_account_member(
+        token, "group-1", "credit_token_1", "0x" + "22" * 20
+    )
+    service.remove_account_member(token, "group-1", "credit_token_1")
+
+    assert service._post.call_args_list == [
+        call(
+            "/auth/groups/group-1/add-owner",
+            {"new_owner": "owner-1", "chain_id": "31337"},
+            token=token,
+        ),
+        call(
+            "/auth/groups/group-1/remove-owner",
+            {"old_owner": "0x" + "11" * 20, "chain_id": "31337"},
+            token=token,
+        ),
+        call(
+            "/auth/groups/group-1/add-account-member",
+            {
+                "obligation_id": "credit_token_1",
+                "chain_id": "31337",
+                "obligation_address": "0x" + "22" * 20,
+            },
+            token=token,
+        ),
+        call(
+            "/auth/groups/group-1/remove-account-member",
+            {"obligation_id": "credit_token_1", "chain_id": "31337"},
+            token=token,
+        ),
+    ]
+
+
+def test_group_account_mutation_fails_closed_without_a_jwt_chain():
+    service = AuthService(_config("31337"))
+    service._post = MagicMock()
+
+    result = service.add_account_member(
+        _jwt({"sub": "user-1"}), "group-1", "credit_token_1"
+    )
+
+    assert result == {
+        "status": "error",
+        "message": (
+            "add_account_member requires an authenticated JWT with a valid "
+            "default_chain_id"
+        ),
+    }
+    service._post.assert_not_called()

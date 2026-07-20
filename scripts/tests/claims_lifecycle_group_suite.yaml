@@ -33,10 +33,12 @@
 #    3. No addresses hardcoded in this file — the IdentityRegistry is backend-resolved.
 #
 #  WHAT THE GROUP-TRUSTED-ISSUER CHECK PROVES (and how it avoids false +/-)
-#    A group is just a user operated via a delegate JWT. Acting AS the group, we
-#    register the group's OWN account as a trusted issuer on its own class IR. Three
-#    things are exercised at once: (a) the resolver maps account → the group's
-#    ClaimIssuer CONTRACT (not the raw account); (b) the operate-as-group delegate
+#    A group is operated through a delegation JWT but has its own stable ONCHAINID-
+#    scoped ClaimIssuer. Acting AS the group, its direct account owner registers the
+#    group's OWN account as a trusted issuer on its own class IR. Three things are
+#    exercised at once: (a) the resolver maps account/linked ONCHAINID → the group's
+#    ClaimIssuer CONTRACT (not the raw account or the actor's personal ClaimIssuer);
+#    (b) the operate-as-group owner path;
 #    path; (c) the decoupling fix — a per-token IR update is a pure owner meta-tx
 #    that no longer fires relay-direct system claims that would steal its nonce.
 #    The GG asserts pin the EXACT outcome (no false positive / negative):
@@ -202,8 +204,8 @@ commands:
   # ════════ D — DELEGATION: claims issued / managed AS A GROUP ════════
   # payer acts AS "Compliance Group" (delegation JWT, acting_as=group). The claim
   # is GROUP-owned (issuer = context_entity_id = group), so issued_by_me AS the
-  # group lists it and the group delegate can revoke/re-issue it — the delegation
-  # fix. (Group account must have a ClaimIssuer, set at group account deploy.)
+  # group lists it and an authorized group account owner can revoke/re-issue it.
+  # The entity ClaimIssuer is created atomically with the group's first account.
   - name: d_group_issue
     type: issue_claim
     user: { id: payer@yieldfabric.com, password: payer_password, group: Compliance Group }
@@ -285,17 +287,15 @@ commands:
 
 
   # ════════ GG — GROUP AS TRUSTED ISSUER (operated via delegate JWT) ════════
-  # Regression guard for the reported bug, validated through the CORRECT model: a
-  # group is operated via a DELEGATION JWT and is otherwise IDENTICAL to a user
-  # account. So a group registers ITSELF as a trusted issuer exactly as a user does
-  # for itself — acting AS the group (acting_as=group), it adds its OWN account
-  # address, and the resolver's step-2 self path maps caller-account → caller's
-  # signer EOA → getClaimIssuer. No cross-entity key fetch, no special group
-  # handling — the same path that works for a user adding its own account.
+#  Regression guard for the reported bug, validated through the correct custody
+#  model: a group is operated via a delegation JWT but owns a distinct, stable
+#  entity ClaimIssuer. Acting AS the group (acting_as=group), its direct owner adds
+#  the group account address; the resolver maps account → linked ONCHAINID → the
+#  entity ClaimIssuer. It must never fall through to the actor's personal issuer.
   #
   # Why this is the right shape: the group's claim (gg_group_issue, issued AS the
-  # group) carries issuer = getClaimIssuer(group signer EOA); the trust-set, also
-  # AS the group, resolves the SAME signer EOA → the SAME ClaimIssuer. So the TIR
+#  group) carries issuer = getEntityClaimIssuer(group ONCHAINID); the trust-set,
+#  also AS the group, resolves the SAME stable identity → the SAME ClaimIssuer. So the TIR
   # entry matches the claim's on-chain issuer (keccak256(issuer, topic)). The OLD
   # bug stored the raw account, which never matched.
   #
@@ -321,9 +321,9 @@ commands:
     parameters: { actual: "$gg_group_issue.claim_issuer_address", contains: "0x" }
 
   # THE FIX, exercised: acting AS the group, register the group's OWN account as a
-  # trusted issuer on the group's own class IR. Resolver step 2 (caller's own
-  # account → caller's signer EOA → getClaimIssuer) maps it to the group's
-  # ClaimIssuer — identical to a user adding itself. A regression would reject.
+  # trusted issuer on the group's own class IR. The resolver maps the caller's
+  # account (or its linked ONCHAINID) to getEntityClaimIssuer, not to the active
+  # delegate's personal ClaimIssuer. A regression would reject or trust the wrong CI.
   - name: gg_trust_group_by_account
     type: update_claim_requirements
     user: { id: payer@yieldfabric.com, password: payer_password, group: Compliance Group }

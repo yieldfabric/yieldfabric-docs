@@ -439,26 +439,59 @@ class AuthService(BaseServiceClient):
         self.logger.error(f"    ❌ Group not found in user's groups: {group_name}")
         return None
 
+    def _group_mutation_chain_id(self, token: str, operation: str) -> Optional[str]:
+        """Return the exact chain assertion carried by the caller's JWT.
+
+        On-chain group mutations are deliberately bound to the authenticated
+        session chain.  Do not fall back to config here: sending a configured
+        chain that differs from the token would turn an SDK error into a
+        server-side chain-confusion failure.
+        """
+        claim = extract_claim(token, "default_chain_id", "chain_id", "chainId")
+        chain_id = str(claim).strip() if claim is not None else ""
+        if not chain_id.isdigit() or int(chain_id) <= 0:
+            self.logger.error(
+                f"    ❌ {operation}: authenticated JWT has no valid default_chain_id"
+            )
+            return None
+        return chain_id
+
+    @staticmethod
+    def _missing_group_mutation_chain(operation: str) -> dict:
+        return {
+            "status": "error",
+            "message": (
+                f"{operation} requires an authenticated JWT with a valid "
+                "default_chain_id"
+            ),
+        }
+
     def add_group_owner(self, token: str, group_id: str, new_owner: str) -> dict:
         """POST /auth/groups/{id}/add-owner — add an on-chain owner."""
+        chain_id = self._group_mutation_chain_id(token, "add_group_owner")
+        if chain_id is None:
+            return self._missing_group_mutation_chain("add_group_owner")
         self.logger.info(
             f"  📤 add_group_owner group_id={group_id[:8]}... new_owner={new_owner}"
         )
         return self._post_json_safe(
             f"/auth/groups/{group_id}/add-owner",
-            {"new_owner": new_owner},
+            {"new_owner": new_owner, "chain_id": chain_id},
             token=token,
             description="add_group_owner",
         )
 
     def remove_group_owner(self, token: str, group_id: str, old_owner: str) -> dict:
         """POST /auth/groups/{id}/remove-owner — remove an on-chain owner."""
+        chain_id = self._group_mutation_chain_id(token, "remove_group_owner")
+        if chain_id is None:
+            return self._missing_group_mutation_chain("remove_group_owner")
         self.logger.info(
             f"  📤 remove_group_owner group_id={group_id[:8]}... old_owner={old_owner}"
         )
         return self._post_json_safe(
             f"/auth/groups/{group_id}/remove-owner",
-            {"old_owner": old_owner},
+            {"old_owner": old_owner, "chain_id": chain_id},
             token=token,
             description="remove_group_owner",
         )
@@ -476,7 +509,10 @@ class AuthService(BaseServiceClient):
         is optional; the backend falls back to its configured default
         confidential-obligation address when None.
         """
-        payload: dict = {"obligation_id": obligation_id}
+        chain_id = self._group_mutation_chain_id(token, "add_account_member")
+        if chain_id is None:
+            return self._missing_group_mutation_chain("add_account_member")
+        payload: dict = {"obligation_id": obligation_id, "chain_id": chain_id}
         if obligation_address:
             payload["obligation_address"] = obligation_address
         self.logger.info(
@@ -497,7 +533,10 @@ class AuthService(BaseServiceClient):
         obligation_address: Optional[str] = None,
     ) -> dict:
         """POST /auth/groups/{id}/remove-account-member."""
-        payload: dict = {"obligation_id": obligation_id}
+        chain_id = self._group_mutation_chain_id(token, "remove_account_member")
+        if chain_id is None:
+            return self._missing_group_mutation_chain("remove_account_member")
+        payload: dict = {"obligation_id": obligation_id, "chain_id": chain_id}
         if obligation_address:
             payload["obligation_address"] = obligation_address
         self.logger.info(
@@ -508,6 +547,20 @@ class AuthService(BaseServiceClient):
             payload,
             token=token,
             description="remove_account_member",
+        )
+
+    def get_group_account_operation(
+        self, token: str, group_id: str, operation_id: str
+    ) -> dict:
+        """Reconcile and read a durable on-chain group mutation."""
+        return self._get_json_safe(
+            f"/auth/groups/{group_id}/account-operations/{operation_id}",
+            token=token,
+            description="get_group_account_operation",
+            default={
+                "status": "error",
+                "message": "Unable to read group account operation",
+            },
         )
 
     def get_account_owners(self, token: str, group_id: str) -> dict:

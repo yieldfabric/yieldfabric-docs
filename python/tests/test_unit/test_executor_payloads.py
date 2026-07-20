@@ -160,3 +160,50 @@ def test_add_account_member_retries_contract_resolution_race(config, services):
 
     assert response.success
     assert auth.add_account_member.call_count == 2
+
+
+def test_add_account_member_waits_for_durable_operation_confirmation(config, services):
+    auth, payments = services
+    auth.login.return_value = "user.jwt"
+    auth.get_user_group_id_by_name.return_value = "group-1"
+    auth.add_account_member.return_value = {
+        "success": True,
+        "status": "pending_signature",
+        "operation_id": "operation-1",
+        "message_id": "message-1",
+    }
+    auth.get_group_account_operation.side_effect = [
+        {
+            "success": True,
+            "status": "pending",
+            "operation_id": "operation-1",
+            "message_id": "message-1",
+        },
+        {
+            "success": True,
+            "status": "confirmed",
+            "operation_id": "operation-1",
+            "message_id": "message-1",
+        },
+    ]
+
+    executor = GroupAdminExecutor(auth, payments, OutputStore(), config)
+    with patch("yieldfabric.executors.group_admin_executor.time.sleep"):
+        response = executor.execute(
+            _command(
+                "add_issuer_group_member_1",
+                "add_account_member",
+                {
+                    "obligation_id": "credit_token_1",
+                    "wait": True,
+                    "wait_interval": 0,
+                },
+                group="Issuer Group",
+            )
+        )
+
+    assert response.success
+    assert response.data["operation_id"] == "operation-1"
+    assert response.data["message_id"] == "message-1"
+    assert response.data["operation_status"] == "confirmed"
+    assert auth.get_group_account_operation.call_count == 2

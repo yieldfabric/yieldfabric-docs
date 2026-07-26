@@ -37,6 +37,14 @@ class _DelegationSession:
     issued_at: float
 
 
+@dataclass
+class _NamedCredential:
+    """Opaque, non-refreshable JWT retained only for this runner process."""
+
+    token: str
+    expires_at: float
+
+
 class TokenManager:
     """Cache user and group-delegation tokens for one runner process."""
 
@@ -57,8 +65,57 @@ class TokenManager:
         self._users: Dict[str, _UserSession] = {}
         self._group_ids: Dict[Tuple[str, str], str] = {}
         self._delegations: Dict[Tuple[str, str], _DelegationSession] = {}
+        self._named_credentials: Dict[str, _NamedCredential] = {}
         self._lock = threading.RLock()
         self.logger = get_logger(debug=config.debug)
+
+    def register_named_credential(self, name: str, token: str) -> None:
+        """
+        Retain a short-lived credential behind an opaque YAML-safe handle.
+
+        The JWT is deliberately not returned or written to OutputStore, whose
+        debug logging would expose it. Named credentials are process-local,
+        non-refreshable, and replaced atomically when a name is reused.
+        """
+        handle = (name or "").strip()
+        if not handle:
+            raise ValueError("credential name must not be empty")
+        if not token or not token.strip():
+            raise ValueError("credential token must not be empty")
+
+        expires_at = get_exp(token)
+        if expires_at is None:
+            raise ValueError("named credential must carry a numeric exp claim")
+        with self._lock:
+            self._named_credentials[handle] = _NamedCredential(
+                token=token,
+                expires_at=expires_at,
+            )
+
+    def get_named_credential(
+        self,
+        name: str,
+        *,
+        allow_expired: bool = False,
+    ) -> Optional[str]:
+        """Resolve an opaque handle without ever logging the underlying JWT."""
+        handle = (name or "").strip()
+        if not handle:
+            return None
+        with self._lock:
+            credential = self._named_credentials.get(handle)
+            if credential is None:
+                return None
+            if not allow_expired and credential.expires_at <= self._now():
+                return None
+            return credential.token
+
+    def named_credential_supplier(
+        self,
+        name: str,
+    ) -> Callable[[], Optional[str]]:
+        """Build a poll-safe supplier for a non-refreshable named JWT."""
+        return lambda: self.get_named_credential(name)
 
     def get_token(
         self,

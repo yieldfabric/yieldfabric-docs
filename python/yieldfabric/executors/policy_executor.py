@@ -134,15 +134,22 @@ class PolicyExecutor(BaseExecutor):
         account_address = self._claim(token, "account_address")
         group_account_address = self._claim(token, "group_account_address")
         default_wallet_id = self._claim(token, "default_wallet_id")
+        default_chain_id = self._claim(token, "default_chain_id")
         sub = get_sub(token)
 
-        # Resolve the acting group's UUID whenever a group context is given —
-        # callers that mint a group delegation (e.g. loan-collect arming) need it.
-        # Also doubles as the fallback for a group account address the delegation
-        # claim didn't carry.
+        # A group delegation is already authoritatively bound to its group by
+        # the signed `acting_as` claim.  Use that claim instead of presenting
+        # the delegation JWT to the direct-user `/auth/groups/user` endpoint,
+        # which correctly rejects delegated callers.  The lookup remains only
+        # as a compatibility fallback for a plain user JWT returned when a
+        # legacy client could not mint a delegation.
         group_id = None
         if command.user.group:
-            group_id = self.auth_service.get_user_group_id_by_name(token, command.user.group)
+            group_id = self._claim(token, "acting_as")
+            if not group_id:
+                group_id = self.auth_service.get_user_group_id_by_name(
+                    token, command.user.group
+                )
             if group_id and not group_account_address:
                 info = self.auth_service.group_account_info(token, group_id)
                 group_account_address = info.get("account_address") or None
@@ -158,6 +165,7 @@ class PolicyExecutor(BaseExecutor):
             "account_address_lc": (account_address or "").lower() or None,
             "group_account_address_lc": (group_account_address or "").lower() or None,
             "default_wallet_id": default_wallet_id,
+            "default_chain_id": default_chain_id,
             "sub": sub,
             "user_id": sub,
         }

@@ -179,6 +179,70 @@ class BaseServiceClient:
                 self.logger.debug(f"{description} failed: {e}")
             return default
 
+    def _request_json_safe(
+        self,
+        method: str,
+        endpoint: str,
+        *,
+        token: Optional[str] = None,
+        data: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Execute an arbitrary JSON REST request and preserve its HTTP outcome.
+
+        This is intended for semantic test executors that need to exercise a
+        denial matrix across several endpoints. It never raises and always
+        returns ``{ok, status_code, body}``.
+        """
+        verb = (method or "").strip().upper()
+        if verb not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+            return {
+                "ok": False,
+                "status_code": 0,
+                "body": {"error": f"unsupported HTTP method: {method}"},
+            }
+        if not endpoint.startswith("/"):
+            return {
+                "ok": False,
+                "status_code": 0,
+                "body": {"error": "endpoint must start with '/'"},
+            }
+
+        url = f"{self.base_url}{endpoint}"
+        self.logger.api_request(verb, url)
+        try:
+            kwargs: Dict[str, Any] = {
+                "headers": self._get_headers(token),
+                "params": params,
+                "timeout": self.config.request_timeout,
+            }
+            if data is not None:
+                kwargs["json"] = json_safe(data)
+            response = self.session.request(verb, url, **kwargs)
+            ok = 200 <= response.status_code < 300
+            self.logger.api_response(response.status_code, ok)
+            try:
+                body: Any = response.json()
+            except ValueError:
+                body = response.text
+            return {
+                "ok": ok,
+                "status_code": response.status_code,
+                "body": body,
+            }
+        except requests.exceptions.RequestException as exc:
+            response = getattr(exc, "response", None)
+            status_code = getattr(response, "status_code", 0) or 0
+            body: Any = str(exc)
+            if response is not None:
+                try:
+                    body = response.json()
+                except ValueError:
+                    body = response.text or str(exc)
+            self.logger.api_response(status_code, False)
+            return {"ok": False, "status_code": status_code, "body": body}
+
     def check_health(self, timeout: Optional[int] = None) -> bool:
         """
         Check if service is healthy.

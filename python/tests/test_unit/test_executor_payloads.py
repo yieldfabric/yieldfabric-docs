@@ -207,3 +207,66 @@ def test_add_account_member_waits_for_durable_operation_confirmation(config, ser
     assert response.data["message_id"] == "message-1"
     assert response.data["operation_status"] == "confirmed"
     assert auth.get_group_account_operation.call_count == 2
+
+
+def test_group_admin_explicit_group_id_supports_ownership_child_tests(
+    config, services
+):
+    auth, payments = services
+    auth.login.return_value = "user.jwt"
+    auth.add_group_owner.return_value = {
+        "success": True,
+        "status": "confirmed",
+        "operation_id": "operation-1",
+        "message_id": "message-1",
+        "keypair_id": "head-key-1",
+        "target_address": "0x1111111111111111111111111111111111111111",
+        "membership_changed": False,
+    }
+
+    executor = GroupAdminExecutor(auth, payments, OutputStore(), config)
+    response = executor.execute(
+        _command(
+            "add_head_owner",
+            "add_owner",
+            {
+                "group_id": "subsidiary-group",
+                "new_owner": "head-key-1",
+                "wait": False,
+            },
+        )
+    )
+
+    assert response.success
+    assert response.data["group_id"] == "subsidiary-group"
+    assert response.data["keypair_id"] == "head-key-1"
+    assert response.data["target_address"].startswith("0x")
+    assert response.data["membership_changed"] is False
+    auth.get_user_group_id_by_name.assert_not_called()
+
+
+def test_group_admin_error_includes_http_status(config, services):
+    auth, payments = services
+    auth.login.return_value = "user.jwt"
+    auth.add_group_owner.return_value = {
+        "status": "error",
+        "status_code": 403,
+        "message": "{'error': 'forbidden'}",
+    }
+
+    executor = GroupAdminExecutor(auth, payments, OutputStore(), config)
+    response = executor.execute(
+        _command(
+            "forbidden_add",
+            "add_owner",
+            {
+                "group_id": "subsidiary-group",
+                "new_owner": "head-key-1",
+            },
+        )
+    )
+
+    assert response.success is False
+    assert response.errors == [
+        "HTTP 403: {'error': 'forbidden'}"
+    ]

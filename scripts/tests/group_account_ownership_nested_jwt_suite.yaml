@@ -1,0 +1,872 @@
+# ════════════════════════════════════════════════════════════════════════════
+# NON-CUSTODIAL NESTED GROUP AUTHORITY — USER EOA → HEAD CO → SUBSIDIARY
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Prerequisite:
+#   cd yieldfabric-docs/python
+#   python3 -m yieldfabric.cli setup ../scripts/setup.yaml
+#
+# Run:
+#   python3 -m yieldfabric.cli execute \
+#     ../scripts/tests/group_account_ownership_nested_jwt_suite.yaml
+#
+# Trust model proved by this suite:
+#
+#   issuer USER key ─hasAccess→ Head Co account
+#       Head Co ─owns→ immutable non-transferable membership NFT
+#       membership NFT ─isMember→ Subsidiary account
+#
+# The A→B edge is created by a three-authority, idempotent saga:
+#   1. a live Subsidiary Owner reserves the relationship with their user JWT;
+#   2. a live Head Co Owner authorizes and settles the NFT mint;
+#   3. the Subsidiary Owner authorizes and settles AddMember.
+#
+# No Head Co group key, Subsidiary group key, platform key, or raw B owner is
+# used as nested authority. Every child JWT binds one exact issuer USER key.
+# Custodial USER key => Automatic. External USER EOA => Manual, with the client
+# recomputing the nonce-bound digest and checking authorization_binding before
+# signing. Child JWTs remain process-local behind opaque credential handles.
+# ════════════════════════════════════════════════════════════════════════════
+
+commands:
+  # ── Distinct human/group contexts ───────────────────────────────────────
+  - name: head_ctx
+    type: whoami
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+
+  - name: subsidiary_ctx
+    type: whoami
+    user: { id: payer@yieldfabric.com, password: payer_password, group: Payer Group }
+
+  - name: outsider_ctx
+    type: whoami
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+
+  - name: sibling_ctx
+    type: whoami
+    user: { id: collateral@yieldfabric.com, password: collateral_password, group: Collateral Group }
+
+  - name: assert_saga_uses_distinct_humans
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$head_ctx.user_id"
+      not_equals: "$subsidiary_ctx.user_id"
+
+  - name: head_custodial_user_signer
+    type: user_signing_key
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { custody: custodial }
+
+  - name: assert_custodial_signer_is_human_key
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$head_custodial_user_signer.user_id"
+      equals: "$head_ctx.user_id"
+
+  # ── Relationship saga: B reserve → A mint → B AddMember ────────────────
+  - name: outsider_cannot_reserve_relationship
+    type: establish_group_owner
+    user: { id: collateral@yieldfabric.com, password: collateral_password }
+    parameters:
+      parent_group_id: "$head_ctx.group_id"
+      child_group_id: "$subsidiary_ctx.group_id"
+      chain_id: "$head_ctx.default_chain_id"
+      expect_failure: true
+      expect_error: "HTTP 403"
+
+  - name: subsidiary_reserves_relationship
+    type: establish_group_owner
+    user: { id: payer@yieldfabric.com, password: payer_password, group: Payer Group }
+    parameters:
+      parent_group_id: "$head_ctx.group_id"
+      child_group_id: "$subsidiary_ctx.group_id"
+      chain_id: "$subsidiary_ctx.default_chain_id"
+
+  - name: assert_reserved_stage_requires_head
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      actual: "$subsidiary_reserves_relationship.stage"
+      equals: parent_credential_authorization_required
+
+  - name: assert_relationship_is_not_active_at_reservation
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      actual: "$subsidiary_reserves_relationship.status"
+      equals: provisioning
+
+  - name: subsidiary_cannot_take_head_authorization_stage
+    type: establish_group_owner
+    user: { id: payer@yieldfabric.com, password: payer_password, group: Payer Group }
+    parameters:
+      parent_group_id: "$head_ctx.group_id"
+      child_group_id: "$subsidiary_ctx.group_id"
+      chain_id: "$subsidiary_ctx.default_chain_id"
+      expect_failure: true
+      expect_error: "HTTP 403"
+
+  # This POST durably enqueues the Head-owned NFT mint. The executor waits for
+  # its parent-group-owned message before returning.
+  - name: head_authorizes_credential_mint
+    type: establish_group_owner
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters:
+      parent_group_id: "$head_ctx.group_id"
+      child_group_id: "$subsidiary_ctx.group_id"
+      chain_id: "$head_ctx.default_chain_id"
+      wait: true
+      wait_timeout: 300
+
+  - name: assert_parent_mint_was_enqueued
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$head_authorizes_credential_mint.stage"
+      equals: parent_credential_pending
+
+  - name: assert_parent_mint_has_message
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$head_authorizes_credential_mint.has_message_id"
+      equals: "True"
+
+  # Idempotent reconcile proves the immutable credential is owned by A, then
+  # hands control back to B for the separate AddMember authorization.
+  - name: head_reconciles_credential_mint
+    type: establish_group_owner
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters:
+      parent_group_id: "$head_ctx.group_id"
+      child_group_id: "$subsidiary_ctx.group_id"
+      chain_id: "$head_ctx.default_chain_id"
+
+  - name: assert_child_membership_requires_subsidiary
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$head_reconciles_credential_mint.stage"
+      equals: child_membership_authorization_required
+
+  # B authorizes AddMember. The message belongs to B, not to the JWT's human
+  # `sub`; the executor derives that from acting_as and waits for settlement.
+  - name: subsidiary_authorizes_child_membership
+    type: establish_group_owner
+    user: { id: payer@yieldfabric.com, password: payer_password, group: Payer Group }
+    parameters:
+      parent_group_id: "$head_ctx.group_id"
+      child_group_id: "$subsidiary_ctx.group_id"
+      chain_id: "$subsidiary_ctx.default_chain_id"
+      wait: true
+      wait_timeout: 300
+
+  # NOTE: no `stage == child_membership_pending` assertion here on purpose.
+  # `PaymentsCaller::submit` waits for the on-chain result, so on a fast chain
+  # AddMember confirms inside this same request and the saga legitimately
+  # returns `active` without ever passing through the pending stage. Asserting
+  # that stage asserts block timing. `has_operation_id` below carries the real
+  # intent — the member operation went through the durable
+  # `group_account_operations` journal — and holds in both cases.
+  - name: assert_add_member_has_operation
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      actual: "$subsidiary_authorizes_child_membership.has_operation_id"
+      equals: "True"
+
+  - name: subsidiary_reconciles_active_relationship
+    type: establish_group_owner
+    user: { id: payer@yieldfabric.com, password: payer_password, group: Payer Group }
+    parameters:
+      parent_group_id: "$head_ctx.group_id"
+      child_group_id: "$subsidiary_ctx.group_id"
+      chain_id: "$subsidiary_ctx.default_chain_id"
+
+  - name: assert_relationship_active
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      actual: "$subsidiary_reconciles_active_relationship.status"
+      equals: active
+
+  - name: assert_relationship_terminal_stage
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      actual: "$subsidiary_reconciles_active_relationship.stage"
+      equals: active
+
+  - name: assert_same_reserved_generation_became_active
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      actual: "$subsidiary_reconciles_active_relationship.relationship_id"
+      equals: "$subsidiary_reserves_relationship.relationship_id"
+
+  - name: active_relationship_retry_is_idempotent
+    type: establish_group_owner
+    user: { id: payer@yieldfabric.com, password: payer_password, group: Payer Group }
+    parameters:
+      parent_group_id: "$head_ctx.group_id"
+      child_group_id: "$subsidiary_ctx.group_id"
+      chain_id: "$subsidiary_ctx.default_chain_id"
+
+  - name: assert_active_retry_did_not_rotate_edge
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      actual: "$active_relationship_retry_is_idempotent.relationship_id"
+      equals: "$subsidiary_reserves_relationship.relationship_id"
+
+  - name: list_active_group_relationship
+    type: list_group_owners
+    user: { id: payer@yieldfabric.com, password: payer_password, group: Payer Group }
+    parameters:
+      child_group_id: "$subsidiary_ctx.group_id"
+      chain_id: "$subsidiary_ctx.default_chain_id"
+
+  - name: assert_relationship_projection_contains_head
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      actual: "$list_active_group_relationship.parent_group_ids_csv"
+      contains: "$head_ctx.group_id"
+
+  # The NFT link is not a user membership and not a raw B owner.
+  - name: subsidiary_members_after_link
+    type: list_group_members
+    user: { id: payer@yieldfabric.com, password: payer_password, group: Payer Group }
+    parameters: { group_id: "$subsidiary_ctx.group_id" }
+
+  - name: assert_head_human_did_not_inherit_b_membership
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      actual: "$subsidiary_members_after_link.member_user_ids_csv"
+      not_contains: "$head_ctx.user_id"
+
+  - name: raw_subsidiary_owners_after_link
+    type: get_account_owners
+    user: { id: payer@yieldfabric.com, password: payer_password, group: Payer Group }
+
+  - name: assert_head_group_is_not_raw_b_owner
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      actual: "$raw_subsidiary_owners_after_link.owners"
+      not_contains: "$head_ctx.group_id"
+
+  # ── Discovery and exchange guards ───────────────────────────────────────
+  - name: personal_token_cannot_discover_owned_groups
+    type: service_request
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      service: auth
+      method: GET
+      path: /auth/groups/$head_ctx.group_id/owned-groups
+      expect_failure: true
+      expect_error: "HTTP 403"
+
+  - name: head_discovers_subsidiary
+    type: discover_owned_groups
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+
+  - name: assert_discovery_contains_subsidiary
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$head_discovers_subsidiary.owned_group_ids_csv"
+      contains: "$subsidiary_ctx.group_id"
+
+  - name: assert_discovery_uses_same_relationship
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$head_discovers_subsidiary.relationship_ids"
+      contains: "$subsidiary_reserves_relationship.relationship_id"
+
+  - name: personal_token_cannot_assume_subsidiary
+    type: service_request
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      service: auth
+      method: POST
+      path: /auth/delegation/jwt/assume-owned-group
+      body:
+        group_id: "$subsidiary_ctx.group_id"
+        signer_key_id: "$head_custodial_user_signer.signer_key_id"
+        delegation_scope: [ReadGroup]
+        expiry_seconds: 600
+      expect_failure: true
+      expect_error: owned_group_parent_required
+
+  - name: head_cannot_assume_itself
+    type: service_request
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters:
+      service: auth
+      method: POST
+      path: /auth/delegation/jwt/assume-owned-group
+      body:
+        group_id: "$head_ctx.group_id"
+        signer_key_id: "$head_custodial_user_signer.signer_key_id"
+        delegation_scope: [ReadGroup]
+        expiry_seconds: 600
+      expect_failure: true
+      expect_error: delegation_cycle
+
+  - name: head_cannot_assume_unowned_sibling
+    type: service_request
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters:
+      service: auth
+      method: POST
+      path: /auth/delegation/jwt/assume-owned-group
+      body:
+        group_id: "$sibling_ctx.group_id"
+        signer_key_id: "$head_custodial_user_signer.signer_key_id"
+        delegation_scope: [ReadGroup]
+        expiry_seconds: 600
+      expect_failure: true
+      expect_error: owner_authority_required
+
+  - name: another_users_key_cannot_be_bound
+    type: user_signing_key
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { custody: custodial }
+
+  - name: head_cannot_bind_payer_user_key
+    type: service_request
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters:
+      service: auth
+      method: POST
+      path: /auth/delegation/jwt/assume-owned-group
+      body:
+        group_id: "$subsidiary_ctx.group_id"
+        signer_key_id: "$another_users_key_cannot_be_bound.signer_key_id"
+        delegation_scope: [ReadGroup, CryptoOperations]
+        expiry_seconds: 600
+      expect_failure: true
+      expect_error: owned_group_signer_required
+
+  # Negative-only lookup: even an existing Head group key cannot be selected
+  # as the human signer under the new model.
+  - name: legacy_head_group_key_for_rejection_only
+    type: group_signing_key
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+
+  - name: head_group_key_cannot_authorize_child
+    type: service_request
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters:
+      service: auth
+      method: POST
+      path: /auth/delegation/jwt/assume-owned-group
+      body:
+        group_id: "$subsidiary_ctx.group_id"
+        signer_key_id: "$legacy_head_group_key_for_rejection_only.signing_key_id"
+        delegation_scope: [ReadGroup, CryptoOperations]
+        expiry_seconds: 600
+      expect_failure: true
+      expect_error: owned_group_signer_required
+
+  - name: policy_scope_cannot_cross_ownership
+    type: service_request
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters:
+      service: auth
+      method: POST
+      path: /auth/delegation/jwt/assume-owned-group
+      body:
+        group_id: "$subsidiary_ctx.group_id"
+        signer_key_id: "$head_custodial_user_signer.signer_key_id"
+        delegation_scope: [PolicyExecution]
+        expiry_seconds: 600
+      expect_failure: true
+      expect_error: PolicyExecution
+
+  # ── Custodial USER signer: Automatic nested execution ───────────────────
+  - name: assume_subsidiary_custodial
+    type: assume_owned_group
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters:
+      group_id: "$subsidiary_ctx.group_id"
+      signer_key_id: "$head_custodial_user_signer.signer_key_id"
+      delegation_scope:
+        - ReadGroup
+        - CryptoOperations
+        - UpdateGroup
+        - ManageGroupMembers
+        - ManageGroupOwners
+        - CreateDelegationToken
+      expiry_seconds: 3600
+      credential_name: owned_subsidiary_custodial
+
+  - name: assert_custodial_child_path
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$assume_subsidiary_custodial.delegation_path_csv"
+      equals: "$head_ctx.group_id,$subsidiary_ctx.group_id"
+
+  - name: assert_custodial_child_authority
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$assume_subsidiary_custodial.authority_source"
+      equals: nft_membership
+
+  - name: assert_custodial_child_has_no_authority_key
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$assume_subsidiary_custodial.has_authority_key_id"
+      equals: "False"
+
+  - name: assert_custodial_child_binds_human_key
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$assume_subsidiary_custodial.signer_key_id"
+      equals: "$head_custodial_user_signer.signer_key_id"
+
+  - name: assert_custodial_child_execution_mode
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$assume_subsidiary_custodial.signer_custody"
+      equals: custodial
+
+  - name: assert_custodial_child_exact_membership_token
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$assume_subsidiary_custodial.membership_token_id"
+      equals: "$subsidiary_reconciles_active_relationship.token_id"
+
+  - name: assert_admin_scope_was_attenuated
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$assume_subsidiary_custodial.delegation_scope_csv"
+      not_contains: ManageGroup
+
+  - name: assert_child_is_non_refreshable
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$assume_subsidiary_custodial.has_refresh_token"
+      equals: "False"
+
+  - name: assert_child_ttl_is_capped
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$assume_subsidiary_custodial.expiry_seconds"
+      lte: "900"
+
+  - name: validate_custodial_child
+    type: validate_credential
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { credential: owned_subsidiary_custodial }
+
+  - name: assert_child_uses_subsidiary_wallet
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$validate_custodial_child.default_wallet_id"
+      equals: "$subsidiary_ctx.default_wallet_id"
+
+  - name: child_cannot_recurse_to_third_group
+    type: service_request
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      credential: owned_subsidiary_custodial
+      service: auth
+      method: POST
+      path: /auth/delegation/jwt/assume-owned-group
+      body:
+        group_id: "$sibling_ctx.group_id"
+        signer_key_id: "$head_custodial_user_signer.signer_key_id"
+        delegation_scope: [ReadGroup]
+        expiry_seconds: 600
+      expect_failure: true
+      expect_error: delegation_depth_exceeded
+
+  # Fund B through its direct owner, then prove nested Automatic debits B.
+  - name: fund_payer_personal
+    type: deposit
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      asset_id: aud-token-asset
+      amount: "1000000000000000000000"
+      idempotency_key: nested-fund-payer-$(date +%s)
+
+  - name: send_funds_to_subsidiary
+    type: instant
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      asset_id: aud-token-asset
+      amount: "1000000000000000000000"
+      destination_id: Payer Group
+      idempotency_key: nested-fund-subsidiary-$(date +%s)
+
+  - name: subsidiary_accepts_funding
+    type: accept_all
+    user: { id: payer@yieldfabric.com, password: payer_password, group: Payer Group }
+    parameters: { denomination: aud-token-asset, wait: true }
+
+  - name: balance_before_custodial_nested_send
+    type: balance
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      credential: owned_subsidiary_custodial
+      asset_id: aud-token-asset
+
+  - name: custodial_nested_send
+    type: instant
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      credential: owned_subsidiary_custodial
+      asset_id: aud-token-asset
+      amount: "100000000000000000000"
+      destination_id: collateral@yieldfabric.com
+      idempotency_key: nested-custodial-send-$(date +%s)
+      wait: true
+
+  - name: balance_after_custodial_nested_send
+    type: balance
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      credential: owned_subsidiary_custodial
+      asset_id: aud-token-asset
+
+  - name: assert_custodial_nested_send_debited_b
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$balance_before_custodial_nested_send.private_balance"
+      minus: "$balance_after_custodial_nested_send.private_balance"
+      equals: "100000000000000000000"
+
+  # ── External USER EOA: Manual nested execution ──────────────────────────
+  # The file deliberately lives outside the repository. If it survives a
+  # clean DB rebuild, user_signing_key re-proves and re-registers the same EOA.
+  - name: head_external_user_signer
+    type: user_signing_key
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      custody: external
+      key_file: /tmp/yieldfabric-nested-head-operator.key
+      key_name: Nested Head operator EOA
+
+  # The human EOA needs direct access to A. This is a normal individual owner
+  # registration on A, not a group→group raw owner edge.
+  - name: add_external_human_owner_to_head
+    type: add_owner
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters:
+      new_owner: "$head_external_user_signer.signer_key_id"
+      wait: true
+
+  - name: assert_external_human_owner_confirmed
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$add_external_human_owner_to_head.operation_status"
+      equals: confirmed
+
+  - name: assume_subsidiary_external
+    type: assume_owned_group
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters:
+      group_id: "$subsidiary_ctx.group_id"
+      signer_key_id: "$head_external_user_signer.signer_key_id"
+      delegation_scope: [ReadGroup, CryptoOperations, ApiRead, ApiWrite]
+      expiry_seconds: 900
+      credential_name: owned_subsidiary_external
+
+  - name: assert_external_child_binds_eoa
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$assume_subsidiary_external.signer_address"
+      equals: "$head_external_user_signer.signer_address"
+
+  - name: assert_external_child_is_manual
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$assume_subsidiary_external.signer_custody"
+      equals: external
+
+  - name: assert_external_child_uses_same_nft_edge
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$assume_subsidiary_external.membership_token_id"
+      equals: "$assume_subsidiary_custodial.membership_token_id"
+
+  - name: start_external_nested_listener
+    type: start_signature_listener
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      credential: owned_subsidiary_external
+      key_file: /tmp/yieldfabric-nested-head-operator.key
+      listener_name: nested_external
+      interval: 0.5
+
+  - name: balance_before_external_nested_send
+    type: balance
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      credential: owned_subsidiary_custodial
+      asset_id: aud-token-asset
+
+  # The listener refuses to sign unless the server's complete
+  # authorization_binding equals the JWT provenance and the recomputed
+  # account+chain+nonce+ordered-transactions digest equals message_hash.
+  - name: external_nested_send
+    type: instant
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      credential: owned_subsidiary_external
+      asset_id: aud-token-asset
+      amount: "1"
+      destination_id: collateral@yieldfabric.com
+      idempotency_key: nested-external-send-$(date +%s)
+      wait: true
+      wait_timeout: 300
+
+  - name: stop_external_nested_listener
+    type: stop_signature_listener
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { listener_name: nested_external }
+
+  - name: assert_external_listener_signed
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$stop_external_nested_listener.signed_count"
+      gte: "1"
+
+  - name: balance_after_external_nested_send
+    type: balance
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      credential: owned_subsidiary_custodial
+      asset_id: aud-token-asset
+
+  - name: assert_external_nested_send_debited_b
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$balance_before_external_nested_send.private_balance"
+      minus: "$balance_after_external_nested_send.private_balance"
+      equals: "1"
+
+  # An external child can use the real unsigned/submit flow above, but it can
+  # never ask payments/auth to sign with a server-held group/platform key.
+  - name: external_child_cannot_request_server_signature
+    type: service_request
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      credential: owned_subsidiary_external
+      service: payments
+      method: POST
+      path: /api/users/$subsidiary_ctx.group_id/messages/00000000-0000-0000-0000-000000000001/sign
+      body: {}
+      expect_failure: true
+      expect_error: "HTTP 403"
+
+  - name: child_cannot_use_generic_auth_sign
+    type: service_request
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      credential: owned_subsidiary_custodial
+      service: auth
+      method: POST
+      path: /key-operations/sign
+      body:
+        key_id: "$head_custodial_user_signer.signer_key_id"
+        entity_type: user
+        entity_id: "$head_ctx.user_id"
+        data: "00"
+        data_format: hex
+      expect_failure: true
+      expect_error: "HTTP 403"
+
+  # ── Child remains operational-only, never persistent B administration ──
+  - name: child_cannot_add_subsidiary_member
+    type: add_member
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      credential: owned_subsidiary_custodial
+      group_id: "$subsidiary_ctx.group_id"
+      member_user_id: "$outsider_ctx.user_id"
+      role: member
+      expect_failure: true
+      expect_error: "HTTP 403"
+
+  - name: child_cannot_create_group_key
+    type: service_request
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      credential: owned_subsidiary_custodial
+      service: auth
+      method: POST
+      path: /auth/groups/$subsidiary_ctx.group_id/keypairs
+      body: { key_type: Signing, key_name: forbidden-nested-key }
+      expect_failure: true
+      expect_error: "HTTP 403"
+
+  - name: child_cannot_mint_direct_delegation
+    type: service_request
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      credential: owned_subsidiary_custodial
+      service: auth
+      method: POST
+      path: /auth/delegation/jwt
+      body:
+        group_id: "$subsidiary_ctx.group_id"
+        delegation_scope: [ReadGroup]
+        expiry_seconds: 600
+      expect_failure: true
+      expect_error: "HTTP 403"
+
+  - name: child_cannot_issue_api_key
+    type: service_request
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      credential: owned_subsidiary_custodial
+      service: auth
+      method: POST
+      path: /auth/api-key/generate
+      body:
+        service_name: forbidden-owned-child
+        description: must not be issued
+      expect_failure: true
+      expect_error: "HTTP 403"
+
+  # ── Live revocation: B authority, immediate execution cutoff ────────────
+  - name: head_cannot_revoke_b_relationship
+    type: revoke_group_owner
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters:
+      parent_group_id: "$head_ctx.group_id"
+      child_group_id: "$subsidiary_ctx.group_id"
+      chain_id: "$head_ctx.default_chain_id"
+      expect_failure: true
+      expect_error: "HTTP 403"
+
+  - name: subsidiary_revokes_relationship
+    type: revoke_group_owner
+    user: { id: payer@yieldfabric.com, password: payer_password, group: Payer Group }
+    parameters:
+      parent_group_id: "$head_ctx.group_id"
+      child_group_id: "$subsidiary_ctx.group_id"
+      chain_id: "$subsidiary_ctx.default_chain_id"
+      wait: true
+      wait_timeout: 300
+
+  # NOTE: no `stage == revocation_pending` assertion here, for the same reason
+  # as `child_membership_pending` above. `PaymentsCaller::submit` waits for the
+  # on-chain result, so on a fast chain the composed removal confirms inside
+  # this same request and the saga legitimately lands on `revoked` without ever
+  # passing through the pending stage. `has_message_id` is no good here either:
+  # it is phase-scoped, so it goes false on that same fast path.
+  # `retry_required` is the timing-independent invariant — it separates
+  # "accepted, in flight or already done" from `revocation_retry_required`,
+  # which is the only outcome that would mean the removal did not take.
+  - name: assert_revocation_did_not_need_retry
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      actual: "$subsidiary_revokes_relationship.retry_required"
+      equals: "False"
+
+  - name: subsidiary_reconciles_revocation
+    type: revoke_group_owner
+    user: { id: payer@yieldfabric.com, password: payer_password, group: Payer Group }
+    parameters:
+      parent_group_id: "$head_ctx.group_id"
+      child_group_id: "$subsidiary_ctx.group_id"
+      chain_id: "$subsidiary_ctx.default_chain_id"
+
+  - name: assert_relationship_revoked
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      actual: "$subsidiary_reconciles_revocation.status"
+      equals: revoked
+
+  - name: discovery_after_revocation
+    type: discover_owned_groups
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+
+  - name: assert_revoked_child_not_discoverable
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$discovery_after_revocation.owned_group_ids_csv"
+      not_contains: "$subsidiary_ctx.group_id"
+
+  # Revocation is enforced by LIVE state, not by waiting the credential out.
+  # `/protected/jwt` re-validates the owned-group session on every call
+  # (`validate_live_owned_group_session`), so a still-signed, still-unexpired
+  # child credential stops validating the moment its relationship is revoked.
+  # `validate_credential` deliberately sends the token even when locally
+  # expired, so the server is the one deciding — and pinning 403 keeps that
+  # honest: an expiry-driven rejection is 401 and would fail this on error
+  # mismatch rather than passing for the wrong reason.
+  - name: old_child_rejected_at_validation_after_revocation
+    type: validate_credential
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      credential: owned_subsidiary_custodial
+      expect_failure: true
+      expect_error: "HTTP 403"
+
+  - name: old_child_cannot_execute_after_live_edge_revocation
+    type: instant
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      credential: owned_subsidiary_custodial
+      asset_id: aud-token-asset
+      amount: "1"
+      destination_id: collateral@yieldfabric.com
+      idempotency_key: nested-revoked-send-$(date +%s)
+      expect_failure: true
+
+  - name: new_exchange_fails_after_revocation
+    type: assume_owned_group
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters:
+      group_id: "$subsidiary_ctx.group_id"
+      signer_key_id: "$head_custodial_user_signer.signer_key_id"
+      delegation_scope: [ReadGroup, CryptoOperations]
+      expiry_seconds: 600
+      credential_name: forbidden_revoked_child
+      expect_failure: true
+      expect_error: owner_authority_required
+
+  # Restore the pre-test direct Head owner set. This removes only the test EOA;
+  # the relationship NFT was already removed from B by the lifecycle DELETE.
+  - name: remove_external_human_owner_from_head
+    type: remove_owner
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters:
+      old_owner: "$head_external_user_signer.signer_address"
+      wait: true
+
+  - name: assert_external_human_owner_removed
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$remove_external_human_owner_from_head.operation_status"
+      equals: confirmed

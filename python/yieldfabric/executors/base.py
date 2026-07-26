@@ -59,6 +59,15 @@ class BaseExecutor:
         Returns:
             JWT token or None if authentication fails
         """
+        credential = command.parameters.get("credential")
+        if credential:
+            if not self.token_manager:
+                self.logger.error(
+                    "  ❌ named credentials require the shared TokenManager"
+                )
+                return None
+            return self.token_manager.get_named_credential(str(credential))
+
         user = command.user
 
         if self.token_manager:
@@ -83,6 +92,12 @@ class BaseExecutor:
         use_delegation: bool = True,
     ) -> Callable[[], Optional[str]]:
         """Return a callable that refreshes the command token as needed."""
+        credential = command.parameters.get("credential")
+        if credential:
+            if not self.token_manager:
+                return lambda: None
+            return self.token_manager.named_credential_supplier(str(credential))
+
         if self.token_manager:
             return self.token_manager.token_supplier(
                 command.user.id,
@@ -380,7 +395,13 @@ class BaseExecutor:
             if err:
                 return err
         """
-        if use_delegation:
+        credential = command.parameters.get("credential")
+        if credential:
+            if not self.token_manager:
+                token = None
+            else:
+                token = self.token_manager.get_named_credential(str(credential))
+        elif use_delegation:
             token = self.get_token(command)
         elif self.token_manager:
             token = self.token_manager.get_token(
@@ -394,8 +415,13 @@ class BaseExecutor:
         if token:
             return token, None
         self.log_command_failure(command)
+        message = (
+            f"Named credential unavailable or expired: {credential}"
+            if credential
+            else "Failed to get JWT token"
+        )
         return None, CommandResponse.error_response(
-            command.name, command.type, ["Failed to get JWT token"]
+            command.name, command.type, [message]
         )
 
     # Fields that are expected to be present on every success response

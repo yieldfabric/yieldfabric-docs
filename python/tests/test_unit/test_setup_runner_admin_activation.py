@@ -1,5 +1,6 @@
 import base64
 import json
+import time
 from unittest.mock import MagicMock, call
 
 from yieldfabric.config import YieldFabricConfig
@@ -11,23 +12,31 @@ ACCOUNT = "0x1111111111111111111111111111111111111111"
 WALLET_ID = f"WLT-eip155-153-{ACCOUNT}"
 
 
-def _jwt(*, wallet: bool) -> str:
+def _jwt(*, wallet: bool, exp=None, subject: str = ADMIN_ID) -> str:
     def encode(value: dict) -> str:
         raw = json.dumps(value, separators=(",", ":")).encode("utf-8")
         return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
     payload = {
-        "sub": ADMIN_ID,
+        "sub": subject,
         "default_chain_id": "153",
         "account_address": ACCOUNT if wallet else None,
         "default_wallet_id": WALLET_ID if wallet else None,
     }
+    if exp is not None:
+        payload["exp"] = exp
     return f"{encode({'alg': 'none', 'typ': 'JWT'})}.{encode(payload)}.sig"
 
 
-def _session(*, wallet: bool, refresh_token: str = "refresh-1") -> dict:
+def _session(
+    *,
+    wallet: bool,
+    refresh_token: str = "refresh-1",
+    exp=None,
+    subject: str = ADMIN_ID,
+) -> dict:
     return {
-        "access_token": _jwt(wallet=wallet),
+        "access_token": _jwt(wallet=wallet, exp=exp, subject=subject),
         "refresh_token": refresh_token,
         "expires_in": 900,
         "raw": {},
@@ -272,3 +281,102 @@ def test_failed_refresh_reauthenticates_only_the_successful_password_source():
         call("admin@yieldfabric.io", "bootstrap-password"),
     ]
     runner.auth_service.authenticate_api_key_session.assert_not_called()
+
+
+def test_expired_cached_admin_refreshes_before_activation():
+    runner = _runner(_config())
+    expired = _session(
+        wallet=False,
+        refresh_token="refresh-1",
+        exp=int(time.time()) - 1,
+    )
+    fresh_walletless = _session(
+        wallet=False,
+        refresh_token="refresh-2",
+        exp=int(time.time()) + 30,
+    )
+    fresh_walleted = _session(
+        wallet=True,
+        refresh_token="refresh-3",
+        exp=int(time.time()) + 30,
+    )
+    runner._admin_session = expired
+    runner._admin_auth_source = {
+        "kind": "password",
+        "email": "admin@yieldfabric.io",
+        "password": "bootstrap-password",
+    }
+    runner.auth_service.refresh_access_token.side_effect = [
+        fresh_walletless,
+        fresh_walleted,
+    ]
+    runner.auth_service.wait_for_chain_account_activation.return_value = {
+        "status": "ready",
+        "chain_id": "153",
+        "account_address": ACCOUNT,
+        "wallet_id": WALLET_ID,
+    }
+
+    token = runner._ensure_admin_chain_account({"users": []})
+
+    assert token == fresh_walleted["access_token"]
+    assert runner.auth_service.refresh_access_token.call_args_list == [
+        call("refresh-1", chain_id="153"),
+        call("refresh-2", chain_id="153"),
+    ]
+    assert (
+        runner.auth_service.wait_for_chain_account_activation.call_args.args[0]
+        == fresh_walletless["access_token"]
+    )
+
+
+def test_expiry_refresh_rejects_principal_switch():
+    runner = _runner(_config())
+    runner._admin_session = _session(
+        wallet=False,
+        exp=int(time.time()) - 1,
+    )
+    runner._admin_auth_source = {
+        "kind": "password",
+        "email": "admin@yieldfabric.io",
+        "password": "bootstrap-password",
+    }
+    runner.auth_service.refresh_access_token.return_value = _session(
+        wallet=False,
+        refresh_token="refresh-2",
+        exp=int(time.time()) + 30,
+        subject="00000000-0000-0000-0000-000000000001",
+    )
+
+    assert runner._ensure_admin({"users": []}) is None
+
+
+def test_activation_auth_failure_refreshes_and_retries_only_once():
+    runner = _runner(_config())
+    walletless = _session(wallet=False, refresh_token="refresh-1")
+    refreshed = _session(wallet=False, refresh_token="refresh-2")
+    runner._admin_session = walletless
+    runner._admin_auth_source = {
+        "kind": "password",
+        "email": "admin@yieldfabric.io",
+        "password": "bootstrap-password",
+    }
+    runner.auth_service.refresh_access_token.return_value = refreshed
+    runner.auth_service.wait_for_chain_account_activation.side_effect = [
+        {
+            "status": "authentication_failed",
+            "http_status": 401,
+            "error": "Invalid token",
+        },
+        {
+            "status": "authentication_failed",
+            "http_status": 401,
+            "error": "Invalid token",
+        },
+    ]
+
+    assert runner._ensure_admin_chain_account({"users": []}) is None
+    assert runner.auth_service.wait_for_chain_account_activation.call_count == 2
+    runner.auth_service.refresh_access_token.assert_called_once_with(
+        "refresh-1", chain_id="153"
+    )

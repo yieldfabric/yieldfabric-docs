@@ -113,6 +113,60 @@ def test_acquire_token_returns_error_when_login_fails(executor, auth_service):
     assert any("JWT" in e for e in err.errors)
 
 
+def test_named_credential_precedes_login_and_delegation(
+    auth_service, payments_service, output_store, config
+):
+    manager = MagicMock()
+    manager.get_named_credential.return_value = "owned.child.jwt"
+    manager.named_credential_supplier.return_value = lambda: "owned.child.jwt"
+    executor = BaseExecutor(
+        auth_service,
+        payments_service,
+        output_store,
+        config,
+        token_manager=manager,
+    )
+    cmd = _command(
+        group="Issuer Group",
+        params=CommandParameters(raw_params={"credential": "owned-b"}),
+    )
+
+    token, err = executor._acquire_token_or_error(
+        cmd, use_delegation=False
+    )
+    assert token == "owned.child.jwt"
+    assert err is None
+    assert executor._token_supplier(cmd)() == "owned.child.jwt"
+    manager.get_named_credential.assert_called_with("owned-b")
+    manager.get_token.assert_not_called()
+    auth_service.login.assert_not_called()
+    auth_service.login_with_group.assert_not_called()
+
+
+def test_missing_named_credential_returns_specific_error(
+    auth_service, payments_service, output_store, config
+):
+    manager = MagicMock()
+    manager.get_named_credential.return_value = None
+    executor = BaseExecutor(
+        auth_service,
+        payments_service,
+        output_store,
+        config,
+        token_manager=manager,
+    )
+    cmd = _command(
+        params=CommandParameters(raw_params={"credential": "expired-child"})
+    )
+
+    token, err = executor._acquire_token_or_error(cmd)
+    assert token is None
+    assert err is not None
+    assert err.errors == [
+        "Named credential unavailable or expired: expired-child"
+    ]
+
+
 # ---- _finalize_graphql_error ------------------------------------------
 
 

@@ -19,7 +19,7 @@ requirements.txt; if not installed, calls raise a clear RuntimeError.
 """
 
 import time
-from typing import Tuple
+from typing import Any, Dict, Sequence, Tuple
 
 # eth-account is an optional dependency. Import lazily and give a
 # helpful error message if the caller tries to use these helpers
@@ -210,3 +210,153 @@ def sign_message_hash(private_key_hex: str, message_hash_hex: str) -> str:
     if sig_hex.startswith("0x"):
         sig_hex = sig_hex[2:]
     return sig_hex
+
+
+# ----------------------------------------------------------------------
+# Nonce-bound ConfidentialAccount Manual envelope verification.
+# ----------------------------------------------------------------------
+
+_UINT256_MAX = (1 << 256) - 1
+
+
+def _hex_bytes(value: Any, label: str, expected_length: int = None) -> bytes:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a hex string")
+    clean = value.strip()
+    if clean.startswith(("0x", "0X")):
+        clean = clean[2:]
+    if len(clean) % 2:
+        raise ValueError(f"{label} must have an even number of hex characters")
+    try:
+        result = bytes.fromhex(clean)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be valid hex") from exc
+    if expected_length is not None and len(result) != expected_length:
+        raise ValueError(f"{label} must be {expected_length} bytes")
+    return result
+
+
+def _uint256(value: Any, label: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be a non-negative integer")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        if value.startswith(("0x", "0X")):
+            if len(value) <= 2:
+                raise ValueError(f"{label} must be a non-negative integer")
+            try:
+                parsed = int(value, 16)
+            except ValueError as exc:
+                raise ValueError(f"{label} must be a non-negative integer") from exc
+        else:
+            if not value or (value != "0" and (value.startswith("0") or not value.isdigit())):
+                raise ValueError(f"{label} must be a canonical decimal integer")
+            parsed = int(value, 10)
+    else:
+        raise ValueError(f"{label} must be a non-negative integer")
+    if parsed < 0 or parsed > _UINT256_MAX:
+        raise ValueError(f"{label} is outside uint256")
+    return parsed
+
+
+def _manual_transaction_fields(transaction: Any, index: int) -> Tuple[Any, Any, Any]:
+    if isinstance(transaction, (list, tuple)):
+        if len(transaction) < 3:
+            raise ValueError(
+                f"transactions[{index}] must contain address, calldata, and value"
+            )
+        return transaction[0], transaction[1], transaction[2]
+    if isinstance(transaction, dict):
+        return (
+            transaction.get("contract_address", transaction.get("contractAddress")),
+            transaction.get(
+                "calldata",
+                transaction.get(
+                    "function_signature", transaction.get("functionSignature")
+                ),
+            ),
+            transaction.get("value"),
+        )
+    raise ValueError(f"transactions[{index}] is invalid")
+
+
+def meta_transaction_message_hash(
+    account_address: str,
+    chain_id: Any,
+    account_nonce: Any,
+    transactions: Sequence[Any],
+) -> str:
+    """
+    Byte-exact mirror of Solidity `MetaTransactionLib.buildMessageHash` and
+    Rust `yieldfabric_vault::sign_meta`.
+
+    Returns bare lower-case 32-byte hex. It performs no RPC, token, key, or
+    database access and is safe to run immediately before wallet consent.
+    """
+    _require_eth_account()
+    from eth_utils import keccak
+
+    account = _hex_bytes(account_address, "account_address", 20)
+    if not isinstance(transactions, (list, tuple)) or not transactions:
+        raise ValueError("transactions must contain at least one operation")
+
+    aggregate = bytes(32)
+    for index, transaction in enumerate(transactions):
+        target, calldata, value = _manual_transaction_fields(transaction, index)
+        target_bytes = _hex_bytes(
+            target, f"transactions[{index}].contract_address", 20
+        )
+        calldata_bytes = _hex_bytes(
+            calldata, f"transactions[{index}].calldata"
+        )
+        value_bytes = _uint256(
+            value, f"transactions[{index}].value"
+        ).to_bytes(32, "big")
+        aggregate = keccak(
+            aggregate + target_bytes + value_bytes + keccak(calldata_bytes)
+        )
+
+    return keccak(
+        account
+        + _uint256(chain_id, "chain_id").to_bytes(32, "big")
+        + _uint256(account_nonce, "account_nonce").to_bytes(32, "big")
+        + aggregate
+    ).hex()
+
+
+def verify_unsigned_transaction_digest(unsigned_tx: Dict[str, Any]) -> str:
+    """
+    Recompute a server Manual envelope and reject any body/hash mismatch.
+
+    The returned digest is bare lower-case hex and can be passed directly to
+    `sign_message_hash`. Missing nonce/operations are a hard failure: accepting
+    an older envelope would silently reintroduce the live-nonce trust gap this
+    migration removes.
+    """
+    if not isinstance(unsigned_tx, dict):
+        raise ValueError("unsigned_tx must be an object")
+    advertised = unsigned_tx.get("message_hash") or unsigned_tx.get("messageHash")
+    if not isinstance(advertised, str):
+        raise ValueError("unsigned_tx is missing message_hash")
+    advertised = advertised.removeprefix("0x").lower()
+    if len(advertised) != 64:
+        raise ValueError("message_hash must be 32 bytes")
+    try:
+        bytes.fromhex(advertised)
+    except ValueError as exc:
+        raise ValueError("message_hash must be valid hex") from exc
+
+    if "account_nonce" not in unsigned_tx:
+        raise ValueError("unsigned_tx is missing account_nonce")
+    computed = meta_transaction_message_hash(
+        unsigned_tx.get("account_address"),
+        unsigned_tx.get("chain_id"),
+        unsigned_tx.get("account_nonce"),
+        unsigned_tx.get("transactions"),
+    )
+    if computed != advertised:
+        raise ValueError(
+            "refusing to sign: message_hash does not match the nonce-bound envelope"
+        )
+    return computed

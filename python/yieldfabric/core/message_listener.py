@@ -38,7 +38,7 @@ other pending signatures.
 from __future__ import annotations
 
 import threading
-from typing import Callable, Optional, Set, Union
+from typing import Any, Callable, Dict, Optional, Set, Union
 
 from ..services import PaymentsService
 from ..utils.logger import get_logger
@@ -75,6 +75,7 @@ class MessageSignatureListener:
         sign_callback: SignerCallback,
         interval: float = 3.0,
         unsigned_tx_timeout: float = 30.0,
+        expected_authorization_binding: Optional[Dict[str, Any]] = None,
         debug: bool = False,
     ):
         if interval <= 0:
@@ -85,6 +86,7 @@ class MessageSignatureListener:
         self._sign_callback = sign_callback
         self._interval = interval
         self._unsigned_tx_timeout = unsigned_tx_timeout
+        self._expected_authorization_binding = expected_authorization_binding
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -126,6 +128,14 @@ class MessageSignatureListener:
             # picked up, but not indefinite.
             join_timeout = timeout if timeout is not None else self._interval + 2.0
             thread.join(timeout=join_timeout)
+        if thread is not None and thread.is_alive():
+            raise RuntimeError(
+                "signature listener did not stop before its bounded deadline; "
+                "its authority remains cancellation-pending"
+            )
+        with self._lock:
+            if self._thread is thread:
+                self._thread = None
         self.logger.info(
             f"  🛑 signature listener stopped (signed={self.signed_count} "
             f"errored={self.errored_count})"
@@ -191,6 +201,8 @@ class MessageSignatureListener:
             return
 
         unsigned_tx = poll.observation
+        if self._stop_event.is_set():
+            return
         unsigned_transaction_id = unsigned_tx.get("unsigned_transaction_id")
         if not isinstance(unsigned_transaction_id, str) or not unsigned_transaction_id.strip():
             self.logger.error(
@@ -199,7 +211,45 @@ class MessageSignatureListener:
             )
             self.errored_count += 1
             return
+        if self._expected_authorization_binding is not None:
+            actual_binding = unsigned_tx.get("authorization_binding")
+            if not isinstance(actual_binding, dict):
+                self.logger.error(
+                    f"  ❌ unsigned transaction for {message_id[:8]}... omitted "
+                    "authorization_binding"
+                )
+                self.errored_count += 1
+                return
+            if set(actual_binding) != set(self._expected_authorization_binding):
+                self.logger.error(
+                    f"  ❌ unsigned transaction for {message_id[:8]}... has "
+                    "an unexpected authorization binding field set"
+                )
+                self.errored_count += 1
+                return
+            mismatches = [
+                key
+                for key, expected in self._expected_authorization_binding.items()
+                if actual_binding.get(key) != expected
+            ]
+            if mismatches:
+                self.logger.error(
+                    f"  ❌ unsigned transaction for {message_id[:8]}... has "
+                    "mismatched authorization binding: "
+                    + ", ".join(mismatches)
+                )
+                self.errored_count += 1
+                return
+        elif "authorization_binding" in unsigned_tx:
+            self.logger.error(
+                f"  ❌ unsigned transaction for {message_id[:8]}... carried "
+                "an unexpected authorization_binding"
+            )
+            self.errored_count += 1
+            return
 
+        if self._stop_event.is_set():
+            return
         try:
             signature_hex = self._sign_callback(unsigned_tx)
         except Exception as e:
@@ -209,6 +259,10 @@ class MessageSignatureListener:
             self.errored_count += 1
             return
 
+        # A user can revoke the listener while an external wallet prompt is
+        # open. A completed signature is not authority to submit after stop().
+        if self._stop_event.is_set():
+            return
         if not signature_hex or not isinstance(signature_hex, str):
             self.logger.error(
                 f"  ❌ signer callback returned invalid signature for {message_id[:8]}..."
@@ -216,6 +270,8 @@ class MessageSignatureListener:
             self.errored_count += 1
             return
 
+        if self._stop_event.is_set():
+            return
         try:
             result = self._payments.submit_signed_message(
                 self._user_id,

@@ -1,0 +1,179 @@
+# ════════════════════════════════════════════════════════════════════════════
+# NFT-BACKED OWNED-GROUP CHILD — TTL FLOOR + HARD EXPIRY
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Slow companion to group_account_ownership_nested_jwt_suite.yaml. It creates
+# the same B-reserve → A-mint → B-AddMember relationship with distinct humans,
+# selects an ordinary issuer USER key, requests a one-second child, verifies
+# the 60-second floor, then proves server validation rejects the signed child
+# immediately after exp. Run after a fresh `setup.yaml`.
+# ════════════════════════════════════════════════════════════════════════════
+
+commands:
+  - name: expiry_head_ctx
+    type: whoami
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+
+  - name: expiry_subsidiary_ctx
+    type: whoami
+    user: { id: payer@yieldfabric.com, password: payer_password, group: Payer Group }
+
+  - name: expiry_human_signer
+    type: user_signing_key
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { custody: custodial }
+
+  - name: expiry_b_reserves_relationship
+    type: establish_group_owner
+    user: { id: payer@yieldfabric.com, password: payer_password, group: Payer Group }
+    parameters:
+      parent_group_id: "$expiry_head_ctx.group_id"
+      child_group_id: "$expiry_subsidiary_ctx.group_id"
+      chain_id: "$expiry_subsidiary_ctx.default_chain_id"
+
+  - name: assert_expiry_reserve_stage
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      actual: "$expiry_b_reserves_relationship.stage"
+      equals: parent_credential_authorization_required
+
+  - name: expiry_a_mints_credential
+    type: establish_group_owner
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters:
+      parent_group_id: "$expiry_head_ctx.group_id"
+      child_group_id: "$expiry_subsidiary_ctx.group_id"
+      chain_id: "$expiry_head_ctx.default_chain_id"
+      wait: true
+      wait_timeout: 300
+
+  - name: expiry_a_reconciles_credential
+    type: establish_group_owner
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters:
+      parent_group_id: "$expiry_head_ctx.group_id"
+      child_group_id: "$expiry_subsidiary_ctx.group_id"
+      chain_id: "$expiry_head_ctx.default_chain_id"
+
+  - name: assert_expiry_requires_b_membership
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$expiry_a_reconciles_credential.stage"
+      equals: child_membership_authorization_required
+
+  - name: expiry_b_adds_membership
+    type: establish_group_owner
+    user: { id: payer@yieldfabric.com, password: payer_password, group: Payer Group }
+    parameters:
+      parent_group_id: "$expiry_head_ctx.group_id"
+      child_group_id: "$expiry_subsidiary_ctx.group_id"
+      chain_id: "$expiry_subsidiary_ctx.default_chain_id"
+      wait: true
+      wait_timeout: 300
+
+  - name: expiry_b_reconciles_active
+    type: establish_group_owner
+    user: { id: payer@yieldfabric.com, password: payer_password, group: Payer Group }
+    parameters:
+      parent_group_id: "$expiry_head_ctx.group_id"
+      child_group_id: "$expiry_subsidiary_ctx.group_id"
+      chain_id: "$expiry_subsidiary_ctx.default_chain_id"
+
+  - name: assert_expiry_relationship_active
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      actual: "$expiry_b_reconciles_active.status"
+      equals: active
+
+  - name: assume_short_lived_subsidiary
+    type: assume_owned_group
+    user: { id: issuer@yieldfabric.com, password: issuer_password, group: Issuer Group }
+    parameters:
+      group_id: "$expiry_subsidiary_ctx.group_id"
+      signer_key_id: "$expiry_human_signer.signer_key_id"
+      delegation_scope: [ReadGroup]
+      expiry_seconds: 1
+      credential_name: owned_subsidiary_short
+
+  - name: assert_short_child_uses_nft_authority
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$assume_short_lived_subsidiary.authority_source"
+      equals: nft_membership
+
+  - name: assert_short_child_binds_human_key
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$assume_short_lived_subsidiary.signer_key_id"
+      equals: "$expiry_human_signer.signer_key_id"
+
+  - name: assert_short_child_has_no_group_authority_key
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$assume_short_lived_subsidiary.has_authority_key_id"
+      equals: "False"
+
+  - name: assert_child_ttl_floor
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$assume_short_lived_subsidiary.expiry_seconds"
+      gte: "60"
+
+  - name: assert_child_ttl_still_bounded
+    type: assert
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      actual: "$assume_short_lived_subsidiary.expiry_seconds"
+      lte: "900"
+
+  - name: validate_short_child_before_expiry
+    type: validate_credential
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { credential: owned_subsidiary_short }
+
+  # One second beyond the ordinary 60-second floor. validate_credential keeps
+  # the expired token locally only for this negative server-validation probe.
+  - name: wait_past_owned_child_expiry
+    type: sleep
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { seconds: 61 }
+
+  - name: hard_expired_child_is_rejected
+    type: validate_credential
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      credential: owned_subsidiary_short
+      expect_failure: true
+      expect_error: "HTTP 401"
+
+  - name: expiry_b_revokes_relationship
+    type: revoke_group_owner
+    user: { id: payer@yieldfabric.com, password: payer_password, group: Payer Group }
+    parameters:
+      parent_group_id: "$expiry_head_ctx.group_id"
+      child_group_id: "$expiry_subsidiary_ctx.group_id"
+      chain_id: "$expiry_subsidiary_ctx.default_chain_id"
+      wait: true
+      wait_timeout: 300
+
+  - name: expiry_b_reconciles_revocation
+    type: revoke_group_owner
+    user: { id: payer@yieldfabric.com, password: payer_password, group: Payer Group }
+    parameters:
+      parent_group_id: "$expiry_head_ctx.group_id"
+      child_group_id: "$expiry_subsidiary_ctx.group_id"
+      chain_id: "$expiry_subsidiary_ctx.default_chain_id"
+
+  - name: assert_expiry_relationship_revoked
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      actual: "$expiry_b_reconciles_revocation.status"
+      equals: revoked

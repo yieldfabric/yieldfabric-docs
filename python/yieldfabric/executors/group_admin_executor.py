@@ -56,10 +56,18 @@ class GroupAdminExecutor(BaseExecutor):
 
     def _resolve_group_id(self, token: str, command: Command) -> Optional[str]:
         """
-        Resolve `command.user.group` → group_id via the caller's
-        group-membership list. Returns None (with a logged error) if
-        the group isn't found or `user.group` wasn't set.
+        Prefer an explicit `parameters.group_id`, otherwise resolve
+        `command.user.group` via the caller's group-membership list.
+
+        The explicit form is required by negative authorization tests that
+        present an ownership-derived child: the child intentionally has no
+        target-group membership row and therefore cannot use membership as a
+        lookup mechanism.
         """
+        explicit_group_id = command.parameters.get("group_id")
+        if explicit_group_id:
+            return str(explicit_group_id)
+
         group_name = command.user.group
         if not group_name:
             self.logger.error(
@@ -109,6 +117,9 @@ class GroupAdminExecutor(BaseExecutor):
         error was populated.
         """
         message = result.get("message") or result.get("error") or fallback
+        status_code = result.get("status_code")
+        if status_code:
+            message = f"HTTP {status_code}: {message}"
         self.log_command_failure(command)
         return CommandResponse.error_response(
             command.name, command.type, [message]
@@ -221,6 +232,9 @@ class GroupAdminExecutor(BaseExecutor):
                 "operation_id": result.get("operation_id"),
                 "message_id": result.get("message_id"),
                 "operation_status": result.get("status"),
+                "keypair_id": result.get("keypair_id"),
+                "target_address": result.get("target_address"),
+                "membership_changed": result.get("membership_changed"),
             },
             success_message=f"add_owner: {new_owner} added to {command.user.group}",
         )
@@ -253,6 +267,9 @@ class GroupAdminExecutor(BaseExecutor):
                 "operation_id": result.get("operation_id"),
                 "message_id": result.get("message_id"),
                 "operation_status": result.get("status"),
+                "keypair_id": result.get("keypair_id"),
+                "target_address": result.get("target_address"),
+                "membership_changed": result.get("membership_changed"),
             },
             success_message=f"remove_owner: {old_owner} removed from {command.user.group}",
         )

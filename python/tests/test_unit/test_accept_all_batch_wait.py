@@ -181,6 +181,41 @@ def test_accept_all_rejects_duplicate_child_message_ids():
     payments.poll_message_completion.assert_not_called()
 
 
+def test_accept_all_business_failure_surfaces_each_payment_error():
+    auth, payments = _services()
+    payments.graphql_mutation.return_value = GraphQLResponse(
+        success=True,
+        data={
+            "acceptAll": {
+                "success": False,
+                "message": "Accepted 0 out of 1 payments (1 failed)",
+                "totalPayments": 1,
+                "acceptedCount": 0,
+                "failedCount": 1,
+                "acceptedPayments": [],
+                "failedPayments": [
+                    {
+                        "paymentId": "payment-1",
+                        "amount": "100",
+                        "error": "actor-bound signing failed",
+                    }
+                ],
+                "timestamp": "2026-07-24T03:24:47Z",
+            }
+        },
+    )
+    executor = PaymentExecutor(auth, payments, OutputStore(), _config())
+
+    response = executor.execute(
+        _command(denomination="aud-token-asset", wait=True)
+    )
+
+    assert not response.success
+    assert "Accepted 0 out of 1 payments" in response.errors[0]
+    assert "payment-1: actor-bound signing failed" in response.errors[0]
+    payments.poll_message_completion.assert_not_called()
+
+
 def test_accept_all_fails_when_any_child_execution_fails():
     auth, payments = _services()
     payments.graphql_mutation.return_value = GraphQLResponse(

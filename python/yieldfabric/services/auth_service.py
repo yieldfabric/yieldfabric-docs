@@ -809,18 +809,11 @@ class AuthService(BaseServiceClient):
             data = response.json()
             return data if isinstance(data, dict) else {}
         except Exception as e:
-            response = getattr(e, "response", None)
-            if response is not None:
-                try:
-                    data = response.json()
-                    if isinstance(data, dict):
-                        return data
-                except Exception:
-                    pass
+            error_state = self._chain_account_error_state(e)
             self.logger.error(
                 f"activate_chain_account({entity_kind}, {chain_id}) failed: {e}"
             )
-            return {}
+            return error_state
 
     def get_chain_account_activation(
         self, token: str, entity_kind: str, entity_id: str, chain_id: str
@@ -834,10 +827,29 @@ class AuthService(BaseServiceClient):
             data = response.json()
             return data if isinstance(data, dict) else {}
         except Exception as e:
+            error_state = self._chain_account_error_state(e)
             self.logger.debug(
                 f"get_chain_account_activation({entity_kind}, {chain_id}) failed: {e}"
             )
+            return error_state
+
+    @staticmethod
+    def _chain_account_error_state(error: Exception) -> dict:
+        """Preserve HTTP status so activation polling can fail closed quickly."""
+        response = getattr(error, "response", None)
+        if response is None:
             return {}
+        try:
+            body = response.json()
+            state = dict(body) if isinstance(body, dict) else {}
+        except Exception:
+            state = {}
+        status_code = getattr(response, "status_code", None)
+        if isinstance(status_code, int):
+            state.setdefault("http_status", status_code)
+            if status_code in (401, 403):
+                state.setdefault("status", "authentication_failed")
+        return state
 
     def wait_for_chain_account_activation(
         self,
@@ -861,6 +873,8 @@ class AuthService(BaseServiceClient):
         )
         for observation in range(max(1, attempts)):
             if state.get("status") == "ready":
+                return state
+            if state.get("http_status") in (401, 403):
                 return state
             if observation >= attempts - 1:
                 break

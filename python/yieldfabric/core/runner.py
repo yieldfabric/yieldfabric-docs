@@ -14,6 +14,7 @@ from ..executors import (
     DealExecutor,
     GroupAdminExecutor,
     ObligationExecutor,
+    OwnedGroupExecutor,
     PaymentExecutor,
     PolicyExecutor,
     ProvisioningExecutor,
@@ -75,6 +76,10 @@ class YieldFabricRunner:
             self.output_store, self.config, self.token_manager
         )
         self.group_admin_executor = GroupAdminExecutor(
+            self.auth_service, self.payments_service,
+            self.output_store, self.config, self.token_manager
+        )
+        self.owned_group_executor = OwnedGroupExecutor(
             self.auth_service, self.payments_service,
             self.output_store, self.config, self.token_manager
         )
@@ -308,6 +313,22 @@ class YieldFabricRunner:
         ]:
             return self.group_admin_executor.execute(command)
 
+        elif command_type in [
+            "user_signing_key",
+            "group_signing_key",
+            "establish_group_owner",
+            "list_group_owners",
+            "revoke_group_owner",
+            "start_signature_listener",
+            "stop_signature_listener",
+            "list_group_members",
+            "discover_owned_groups",
+            "assume_owned_group",
+            "validate_credential",
+            "service_request",
+        ]:
+            return self.owned_group_executor.execute(command)
+
         elif command_type == "composed_operation":
             return self.composed_executor.execute(command)
 
@@ -404,6 +425,7 @@ class YieldFabricRunner:
     
     def close(self):
         """Close service connections."""
+        self.owned_group_executor.close()
         self.auth_service.close()
         self.payments_service.close()
         self.agents_service.close()

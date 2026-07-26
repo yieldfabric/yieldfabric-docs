@@ -350,7 +350,13 @@ class YieldFabricSetupRunner:
             self._users_ensured = True
 
     def _ensure_admin(self, setup: Dict[str, Any]) -> Optional[str]:
-        """Acquire and cache the admin token bundle (API key or password)."""
+        """Acquire and cache a usable admin token bundle.
+
+        Setup can legitimately outlive a short access-token TTL while creating
+        users and groups. Refresh an expired or near-expiry cached token before
+        returning it so a later wallet-bound phase does not reuse a bearer that
+        Auth will reject.
+        """
         if self._admin_session is None:
             self._admin_session = self._acquire_admin_session(
                 setup.get("users") or []
@@ -358,7 +364,74 @@ class YieldFabricSetupRunner:
         if not self._admin_session:
             return None
         token = self._admin_session.get("access_token")
-        return token if isinstance(token, str) and token else None
+        if not isinstance(token, str) or not token:
+            return None
+        if not self._admin_token_needs_refresh(token):
+            return token
+
+        chain_id = self.config.chain_id or extract_claim(
+            token, "default_chain_id", "chain_id", "chainId"
+        )
+        if not chain_id:
+            self.logger.error(
+                "❌ Expiring provisioning JWT has no chain for refresh"
+            )
+            return None
+
+        expected_entity = get_sub(token)
+        refreshed = self._renew_admin_session(str(chain_id))
+        fresh_token = self._accept_refreshed_admin_session(
+            refreshed,
+            expected_entity=expected_entity,
+            expected_chain=str(chain_id),
+        )
+        if fresh_token:
+            self.logger.info(
+                "  🔁 Refreshed provisioning JWT before cached access expired"
+            )
+        return fresh_token
+
+    def _admin_token_needs_refresh(self, token: str) -> bool:
+        """Return true when a JWT is inside the setup renewal safety window."""
+        expiry = extract_claim(token, "exp")
+        if expiry is None:
+            # Compatibility with older/opaque test credentials. Auth remains
+            # the authority and will reject a malformed real bearer.
+            return False
+        try:
+            expires_at = float(expiry)
+        except (TypeError, ValueError):
+            return True
+        return expires_at <= time.time() + self._ADMIN_REFRESH_SKEW_SECONDS
+
+    def _accept_refreshed_admin_session(
+        self,
+        refreshed: Optional[Dict[str, Any]],
+        *,
+        expected_entity: Optional[str],
+        expected_chain: str,
+    ) -> Optional[str]:
+        """Cache a refreshed session only if principal and chain stay bound."""
+        if not refreshed:
+            return None
+        fresh_token = refreshed.get("access_token")
+        if not isinstance(fresh_token, str) or not fresh_token:
+            return None
+        fresh_entity = get_sub(fresh_token)
+        fresh_chain = extract_claim(
+            fresh_token, "default_chain_id", "chain_id", "chainId"
+        )
+        if (
+            not expected_entity
+            or fresh_entity != expected_entity
+            or str(fresh_chain or "") != expected_chain
+        ):
+            self.logger.error(
+                "❌ Refreshed provisioning JWT changed principal or chain"
+            )
+            return None
+        self._admin_session = refreshed
+        return fresh_token
 
     def _renew_admin_session(self, chain_id: str) -> Optional[Dict[str, Any]]:
         """Refresh the same provisioning principal after lazy activation."""
@@ -455,6 +528,25 @@ class YieldFabricSetupRunner:
             attempts=self._ACCT_POLL_ATTEMPTS,
             interval=self._ACCT_POLL_INTERVAL,
         )
+        if activation.get("http_status") in (401, 403):
+            # The JWT may have expired during a long activation. Rotate once,
+            # preserve the exact principal/chain binding, and reconcile the
+            # same idempotent activation attempt.
+            refreshed_for_retry = self._renew_admin_session(str(chain_id))
+            retry_token = self._accept_refreshed_admin_session(
+                refreshed_for_retry,
+                expected_entity=entity_id,
+                expected_chain=str(chain_id),
+            )
+            if retry_token:
+                activation = self.auth_service.wait_for_chain_account_activation(
+                    retry_token,
+                    "user",
+                    entity_id,
+                    str(chain_id),
+                    attempts=self._ACCT_POLL_ATTEMPTS,
+                    interval=self._ACCT_POLL_INTERVAL,
+                )
         if activation.get("status") != "ready":
             self._admin_account_failed = True
             detail = activation.get("error") or repr(activation)
@@ -807,6 +899,7 @@ class YieldFabricSetupRunner:
 
     _ACCT_POLL_ATTEMPTS = 60       # ~120s reconciliation window after POST returns
     _ACCT_POLL_INTERVAL = 2.0
+    _ADMIN_REFRESH_SKEW_SECONDS = 5.0
     _ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
     def _print_user_account_address(

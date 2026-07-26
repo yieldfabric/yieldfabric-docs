@@ -392,12 +392,20 @@ class PaymentsService(BaseServiceClient):
         POST /api/users/{user_id}/messages/{message_id}/submit-signed-message.
         Hands a locally-produced signature back to the backend, bound to the
         exact unsigned-transaction generation returned by the GET endpoint.
+
+        The endpoint requires a `0x`-prefixed hex string — the shape a browser
+        wallet's `signMessage` returns, and what the wallet-SDK forwards.
+        Local signers (and any user-supplied `sign_callback`) commonly hand
+        back bare hex, so normalise here: this is the one boundary every
+        submission crosses, and the prefix is a wire concern, not a signing
+        one. Idempotent for callbacks that already prefix.
         """
+        signature = f"0x{(signature_hex or '').strip().removeprefix('0x')}"
         try:
             response = self._post(
                 f"/api/users/{user_id}/messages/{message_id}/submit-signed-message",
                 data={
-                    "signature": signature_hex,
+                    "signature": signature,
                     "unsigned_transaction_id": unsigned_transaction_id,
                 },
                 token=token,
@@ -431,19 +439,38 @@ class PaymentsService(BaseServiceClient):
         GET /api/users/{user_id}/messages/awaiting-signature. Returns the
         list (possibly empty) of messages that need a manual signature
         from the user. Called by the background signature listener.
+
+        The endpoint answers with the `{"messages": [...], "count": N}`
+        envelope; a bare list is also accepted so an older server stays
+        readable. An unrecognised 2xx body RAISES rather than reporting
+        "nothing to sign": an empty list is an affirmative claim here —
+        the listener treats it as idle and `poll_signatures_cleared`
+        reads it as "everything is signed" — so a shape mismatch must
+        never be able to masquerade as one.
         """
         try:
             response = self._get(
                 f"/api/users/{user_id}/messages/awaiting-signature",
                 token=token,
             )
-            data = response.json()
-            if isinstance(data, list):
-                return data
-            return []
         except Exception as e:
-            self.logger.debug(f"get_messages_awaiting_signature failed: {e}")
+            # Transport error or non-2xx: retryable, so report nothing
+            # pending and let the caller poll again — but say so aloud,
+            # because a listener that can never see work looks exactly
+            # like one that has none.
+            self.logger.warning(f"get_messages_awaiting_signature failed: {e}")
             return []
+
+        data = response.json()
+        if isinstance(data, dict):
+            data = data.get("messages")
+        if not isinstance(data, list):
+            raise ValueError(
+                "awaiting-signature response is neither a list nor a "
+                "{'messages': [...]} envelope (got "
+                f"{type(data).__name__})"
+            )
+        return data
 
     def get_workflow_status(self, workflow_id: str, token: str) -> Optional[dict]:
         """

@@ -8,6 +8,7 @@ from .composed_executor import ComposedExecutor
 from .deal_executor import DealExecutor
 from .group_admin_executor import GroupAdminExecutor
 from .obligation_executor import ObligationExecutor
+from .owned_group_executor import OwnedGroupExecutor
 from .payment_executor import PaymentExecutor
 from .policy_executor import PolicyExecutor
 from .provisioning_executor import ProvisioningExecutor
@@ -24,6 +25,7 @@ __all__ = [
     "DealExecutor",
     "GroupAdminExecutor",
     "ObligationExecutor",
+    "OwnedGroupExecutor",
     "PaymentExecutor",
     "PolicyExecutor",
     "ProvisioningExecutor",

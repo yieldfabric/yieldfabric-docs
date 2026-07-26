@@ -151,6 +151,29 @@ def test_delegation_session_retains_its_distinct_refresh_token():
     ) == delegation
 
 
+def test_activation_polling_stops_immediately_on_authentication_failure():
+    service = AuthService(_config("153"))
+    service.activate_chain_account = MagicMock(return_value={
+        "status": "authentication_failed",
+        "http_status": 401,
+        "error": "Invalid token",
+    })
+    service.get_chain_account_activation = MagicMock()
+
+    state = service.wait_for_chain_account_activation(
+        "expired-token",
+        "user",
+        "user-1",
+        "153",
+        attempts=60,
+        interval=0,
+    )
+
+    assert state["http_status"] == 401
+    service.activate_chain_account.assert_called_once()
+    service.get_chain_account_activation.assert_not_called()
+
+
 def test_create_group_is_off_chain_before_explicit_activation():
     service = AuthService(_config("153"))
     response = _response({"id": "group-1", "account_activation": None})

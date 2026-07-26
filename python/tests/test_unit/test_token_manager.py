@@ -268,6 +268,44 @@ def test_legacy_auth_client_without_session_api_still_mints_delegation_token():
     assert manager.refresh_token_for_access_token(delegation_token) is None
 
 
+def test_named_credential_is_process_local_non_refreshable_and_hard_expires():
+    auth = MagicMock()
+    child = _jwt({
+        "sub": "user-1",
+        "acting_as": "group-b",
+        "delegation_path": ["group-a", "group-b"],
+        "exp": 1060,
+    })
+    now = [1000.0]
+    manager = TokenManager(auth, _config(), now=lambda: now[0])
+
+    manager.register_named_credential("owned-b", child)
+    assert manager.get_named_credential("owned-b") == child
+    assert manager.named_credential_supplier("owned-b")() == child
+    assert manager.refresh_token_for_access_token(child) is None
+
+    now[0] = 1060.0
+    assert manager.get_named_credential("owned-b") is None
+    assert manager.named_credential_supplier("owned-b")() is None
+    assert manager.get_named_credential("owned-b", allow_expired=True) == child
+
+
+def test_named_credential_requires_handle_token_and_exp():
+    manager = TokenManager(MagicMock(), _config(), now=lambda: 1000.0)
+
+    for name, token in [
+        ("", _jwt({"exp": 1060})),
+        ("owned-b", ""),
+        ("owned-b", _jwt({"sub": "user-1"})),
+    ]:
+        try:
+            manager.register_named_credential(name, token)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid named credential must be rejected")
+
+
 def test_message_poll_resolves_token_supplier_for_each_probe():
     payments = PaymentsService(_config())
     seen_tokens = []

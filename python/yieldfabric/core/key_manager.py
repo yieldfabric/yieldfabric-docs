@@ -29,6 +29,7 @@ whatever unsigned-tx dict the backend returns.
 from __future__ import annotations
 
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -39,6 +40,7 @@ from ..utils.crypto import (
     generate_ethereum_key,
     sign_message_hash,
     sign_ownership_message,
+    verify_unsigned_transaction_digest,
 )
 from ..utils.logger import get_logger
 
@@ -50,9 +52,9 @@ class EnsureKeyResult:
 
     - `address`: 0x-prefixed Ethereum address of the key.
     - `private_key_hex`: private key (hex, no 0x prefix) — KEEP SECRET.
-    - `key_id`: backend's UUID for the key pair. None only if the
-      key file pre-existed and the auth service doesn't know the
-      address (shouldn't happen in practice).
+    - `key_id`: backend's UUID for the key pair. A pre-existing file whose
+      database row was removed is re-proved and re-registered with the same
+      EOA; the method fails rather than returning an unbound key.
     - `newly_created`: True if this run generated and registered a
       new key; False if we reused an existing file.
     """
@@ -61,6 +63,72 @@ class EnsureKeyResult:
     private_key_hex: str
     key_id: Optional[str]
     newly_created: bool
+
+
+def _validated_private_key_hex(value: str, path: Path) -> str:
+    private_key_hex = value.strip().removeprefix("0x").strip()
+    if (
+        len(private_key_hex) != 64
+        or any(char not in "0123456789abcdefABCDEF" for char in private_key_hex)
+    ):
+        raise ValueError(f"invalid private key file: {path}")
+    return private_key_hex
+
+
+def _read_private_key_file(path: Path) -> str:
+    """Open once, without following a final symlink, then verify/read that fd."""
+    if path.is_symlink():
+        raise ValueError(f"signer key path must be a regular file: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(str(path), flags)
+    except OSError as exc:
+        raise ValueError(f"could not securely open signer key file: {path}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"signer key path must be a regular file: {path}")
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "r", encoding="ascii") as key_file:
+            descriptor = -1
+            return _validated_private_key_hex(key_file.read(), path)
+    except OSError as exc:
+        raise RuntimeError(
+            f"could not securely read signer key file: {path}"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _create_private_key_file(path: Path, private_key_hex: str) -> None:
+    """Atomically create an owner-only key file before remote registration."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(str(path), flags, 0o600)
+    except FileExistsError as exc:
+        raise RuntimeError(
+            f"signer key path appeared during secure creation: {path}"
+        ) from exc
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="ascii") as key_file:
+            descriptor = -1
+            key_file.write(
+                _validated_private_key_hex(private_key_hex, path) + "\n"
+            )
+            key_file.flush()
+            os.fsync(key_file.fileno())
+    except Exception:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 class KeyManager:
@@ -105,13 +173,15 @@ class KeyManager:
             - Return with newly_created=False.
 
         If `key_file_path` does NOT exist:
-            - Generate a new key.
+            - Generate a new key and atomically persist it owner-only.
             - If verify_ownership: POST /keys/external/verify-ownership
               to sanity-check the signature before registering.
             - POST /keys/external to register.
-            - Write the private key to `key_file_path` (hex, one line,
-              parent dir created if missing).
             - Return with newly_created=True.
+
+        Persistence precedes remote registration so a local write failure can
+        never leave an auth/on-chain authority whose private half was lost.
+        If registration fails, the key file is retained for a safe retry.
 
         `register_with_wallet` passes through to the POST /keys/external
         payload; set True to also link this key as an owner of the
@@ -120,17 +190,31 @@ class KeyManager:
         path = Path(key_file_path)
 
         if path.exists():
-            private_key_hex = path.read_text().strip().removeprefix("0x").strip()
-            if not private_key_hex or len(private_key_hex) < 32:
-                raise ValueError(f"invalid or empty key file: {path}")
-
+            private_key_hex = _read_private_key_file(path)
             address = address_from_private_key(private_key_hex)
             key_id = self.auth_service.get_key_id_by_address(
                 self.token, self.user_id, address
             )
+            if not key_id:
+                # The test/operator key file can legitimately outlive a clean
+                # auth database. Re-prove the same EOA and recreate only this
+                # user's external-key row; never generate a replacement behind
+                # the caller's back because that would change on-chain
+                # authority.
+                key_id = self._prove_and_register(
+                    private_key_hex,
+                    address,
+                    key_name=key_name,
+                    register_with_wallet=register_with_wallet,
+                    verify_ownership=verify_ownership,
+                )
+                if not key_id:
+                    raise RuntimeError(
+                        "auth recreated the external key without returning id"
+                    )
             self.logger.info(
                 f"  🔑 reusing external key from {path} address={address}"
-                + (f" key_id={key_id[:8]}..." if key_id else " (key_id unknown)")
+                + f" key_id={key_id[:8]}..."
             )
             return EnsureKeyResult(
                 address=address,
@@ -141,31 +225,61 @@ class KeyManager:
 
         # Fresh key path.
         self.logger.info(f"  🔑 generating new external key for {path}")
-        result = self.generate_and_register(
+        private_key_hex, address = generate_ethereum_key()
+        # Persist before the remote mutation. If registration fails, the same
+        # EOA remains recoverable and the next run re-proves it; no unowned
+        # auth row can be created after a local write failure.
+        _create_private_key_file(path, private_key_hex)
+        key_id = self._prove_and_register(
+            private_key_hex,
+            address,
             key_name=key_name,
             register_with_wallet=register_with_wallet,
             verify_ownership=verify_ownership,
         )
-
-        # Persist the private key to disk. Create parent dir if needed;
-        # write as a single line of hex with trailing newline (matches
-        # the shell-era issuer_external_key.txt format so cross-reading
-        # works in both directions).
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(result.private_key_hex.strip() + "\n")
-
-        # On POSIX, tighten permissions so the key file isn't readable
-        # by other users. Best-effort — failure here is non-fatal.
-        try:
-            os.chmod(path, 0o600)
-        except Exception:
-            pass
+        result = EnsureKeyResult(
+            address=address,
+            private_key_hex=private_key_hex,
+            key_id=key_id,
+            newly_created=True,
+        )
 
         self.logger.success(
             f"  ✅ key registered: address={result.address} key_id={result.key_id} "
             f"saved to {path}"
         )
         return result
+
+    def _prove_and_register(
+        self,
+        private_key_hex: str,
+        address: str,
+        *,
+        key_name: str,
+        register_with_wallet: bool,
+        verify_ownership: bool,
+    ) -> Optional[str]:
+        message, signature = sign_ownership_message(address, private_key_hex)
+        if verify_ownership:
+            verify = self.auth_service.verify_external_key_ownership(
+                self.token,
+                public_key=address,
+                message=message,
+                signature=signature,
+            )
+            if not verify.get("valid"):
+                raise RuntimeError(
+                    f"verify-ownership returned valid=false: {verify.get('message')}"
+                )
+        key_pair = self.auth_service.register_external_key(
+            self.token,
+            user_id=self.user_id,
+            key_name=key_name,
+            public_key=address,
+            register_with_wallet=register_with_wallet,
+        )
+        key_id = key_pair.get("id")
+        return str(key_id) if key_id else None
 
     def generate_and_register(
         self,
@@ -179,32 +293,17 @@ class KeyManager:
         Does NOT persist to disk — use `ensure_external_key` for that.
         """
         private_key_hex, address = generate_ethereum_key()
-        message, signature = sign_ownership_message(address, private_key_hex)
-
-        if verify_ownership:
-            verify = self.auth_service.verify_external_key_ownership(
-                self.token,
-                public_key=address,
-                message=message,
-                signature=signature,
-            )
-            if not verify.get("valid"):
-                raise RuntimeError(
-                    f"verify-ownership returned valid=false: {verify.get('message')}"
-                )
-
-        key_pair = self.auth_service.register_external_key(
-            self.token,
-            user_id=self.user_id,
+        key_id = self._prove_and_register(
+            private_key_hex,
+            address,
             key_name=key_name,
-            public_key=address,
             register_with_wallet=register_with_wallet,
+            verify_ownership=verify_ownership,
         )
-        key_id = key_pair.get("id")
         return EnsureKeyResult(
             address=address,
             private_key_hex=private_key_hex,
-            key_id=str(key_id) if key_id else None,
+            key_id=key_id,
             newly_created=True,
         )
 
@@ -231,33 +330,41 @@ class FileBackedSigner:
     format the contract's ecrecover expects.
     """
 
-    def __init__(self, key_file_path: Union[str, Path]):
+    def __init__(
+        self,
+        key_file_path: Union[str, Path],
+        *,
+        expected_address: Optional[str] = None,
+    ):
         self.path = Path(key_file_path)
         if not self.path.exists():
             raise FileNotFoundError(f"signer key file not found: {self.path}")
-        self._private_key_hex = (
-            self.path.read_text().strip().removeprefix("0x").strip()
-        )
-        if not self._private_key_hex:
-            raise ValueError(f"key file is empty: {self.path}")
+        self._private_key_hex = _read_private_key_file(self.path)
         # Derive + cache address once; surfaces key-format errors eagerly.
         self.address = address_from_private_key(self._private_key_hex)
+        if (
+            expected_address
+            and self.address.lower() != str(expected_address).strip().lower()
+        ):
+            raise ValueError(
+                "signer key file address does not match the JWT-bound signer"
+            )
 
     def __call__(self, unsigned_tx: dict) -> str:
         """
         Sign the message_hash from `unsigned_tx`. Returns a 130-hex-char
-        signature (no 0x prefix) — the shape the submit-signed-message
-        endpoint expects.
+        signature (no 0x prefix).
+
+        The submit-signed-message endpoint wants it `0x`-prefixed, matching
+        a browser wallet's `signMessage`; `PaymentsService.submit_signed_message`
+        normalises at that boundary, so a `sign_callback` may return either
+        shape.
         """
         if not isinstance(unsigned_tx, dict):
             raise ValueError(
                 "unsigned_tx must be a dict (GET unsigned-transaction response)"
             )
-        message_hash = unsigned_tx.get("message_hash") or unsigned_tx.get("messageHash")
-        if not message_hash:
-            raise ValueError(
-                f"unsigned_tx is missing message_hash field; keys: {list(unsigned_tx.keys())}"
-            )
+        message_hash = verify_unsigned_transaction_digest(unsigned_tx)
         return sign_message_hash(self._private_key_hex, message_hash)
 
     def __repr__(self) -> str:  # pragma: no cover — debug aid

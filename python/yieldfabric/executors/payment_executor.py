@@ -371,9 +371,19 @@ class PaymentExecutor(BaseExecutor):
 
         data = response.get_data("acceptAll", {})
         if not data.get("success"):
+            message = data.get("message", "acceptAll not successful")
+            failed_payments = data.get("failedPayments") or []
+            details = [
+                f"{payment.get('paymentId', 'unknown payment')}: "
+                f"{payment.get('error', 'unknown error')}"
+                for payment in failed_payments
+                if isinstance(payment, dict)
+            ]
+            if details:
+                message = f"{message}; " + "; ".join(details)
             return self._finalize_business_error(
                 command,
-                data.get("message", "acceptAll not successful"),
+                message,
                 operation_name="AcceptAll",
             )
 

@@ -330,6 +330,7 @@ def test_whoami_resolves_addresses_from_claims(config, services):
     auth, payments = services
     auth.login_with_group.return_value = _jwt_with_claims(
         sub="issuer-uuid",
+        acting_as="issuer-group-uuid",
         account_address="0xOWNER",
         group_account_address="0xGROUP",
         default_wallet_id="wallet-uuid",
@@ -343,6 +344,8 @@ def test_whoami_resolves_addresses_from_claims(config, services):
     assert store.get("owner_ctx", "group_account_address") == "0xGROUP"
     assert store.get("owner_ctx", "account_address") == "0xOWNER"
     assert store.get("owner_ctx", "default_wallet_id") == "wallet-uuid"
+    assert store.get("owner_ctx", "group_id") == "issuer-group-uuid"
     assert store.get("owner_ctx", "sub") == "issuer-uuid"
-    # No group fallback HTTP call was needed (the claim was present).
+    # Group identity and account data came from signed delegation claims.
+    auth.get_user_group_id_by_name.assert_not_called()
     auth.group_account_info.assert_not_called()

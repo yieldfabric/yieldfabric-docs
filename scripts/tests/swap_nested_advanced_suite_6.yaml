@@ -1,0 +1,786 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  NESTED-REPO ADVANCED MATRIX — SIX-DECIMAL VARIANT
+#  rolls × rehyp, order variants, payment-collateral rehyp, depth-3
+#  re-rehypothecation, balance-asserted routing — all on 6-decimal tokens.
+# ════════════════════════════════════════════════════════════════════════════
+#
+#  Fourth suite in the swap/repo family:
+#    swap_repo_suite.yaml             — single-level lifecycle + happy rehyp unwind
+#    swap_rehyp_forfeiture_suite.yaml — 2-level forfeiture/transfer matrix (F2–F5)
+#    swap_nested_advanced_suite.yaml  — the dimensions those two leave uncovered
+#    THIS                             — that same matrix at 6 decimals
+#
+#  WHY THIS EXISTS
+#    Every token deploy_clean.ts deploys uses TOKEN_DECIMALS = 18, so the entire
+#    e2e corpus only ever exercised 18-decimal amounts. Several code paths used
+#    ORDER OF MAGNITUDE as a proxy for "is this value already scaled" — a proxy
+#    that happens to be correct at 18 decimals and wrong everywhere else. That
+#    class of bug was invisible to every suite until a 6-decimal token (AUDF,
+#    decimals() == 6) went live on Redbelly mainnet. This suite is the same
+#    matrix with the scale changed, so the assumption can't hide again.
+#
+#  SCALE
+#    Identical HUMAN amounts to the 18-decimal suite — every raw value is just
+#    divided by 10^12. 1,000 tokens is 1000000000 here, not 10^21. When editing,
+#    keep the two suites' human amounts in step so their results stay comparable.
+#    Chain-time advances (`seconds:`) and swap ids are NOT amounts — don't scale.
+#
+#  FIXTURE — required, and NOT created by deploy_clean.ts
+#    Two 6-decimal ConfidentialTreasury tokens, registered as CASH assets:
+#      aud-token-asset  "AUDFT"  <- stands in for aud-token-asset
+#      usdc-asset  "USDCT"  <- stands in for usdc-asset
+#    Asset ids deliberately carry NO "-token" infix, matching how the live AUDF
+#    asset is named (audf-asset) — that shape is itself load-bearing in the
+#    frontend's token-id resolution.
+#    Create them with scripts/tests/fixtures/deploy_6dec_fixture.js, which
+#    deploys both tokens, registers token+asset, and funds payer/investor/issuer.
+#
+#  Run:  python -m yieldfabric.cli execute scripts/tests/swap_nested_advanced_suite_6.yaml
+#  Assumes a FRESH deploy + setup.yaml + the fixture above (chain-time drift
+#  starts at 0; forfeit scenarios use GROWING deadlines because
+#  advance_chain_time is cumulative).
+#
+#  Chain primitive (depth-2):  underlying → A(payer⇄investor) → Cont_A → B(investor⇄issuer)
+#    Cont_A = COMPOSED-CONTRACT-REPO-SWAP-<A swap_id> (the lender-A position, re-pledged into B)
+#  Depth-3 adds:               Cont_B → C(issuer⇄collateral)
+#
+#  Roles:  payer=borrower A · investor=lender A / borrower B · issuer=lender B / borrower C
+#          Only payer/investor/issuer are funded in the test env, so roll-in lenders and the
+#          depth-3 end-lender REUSE a funded party not already in that swap: G1/G3 roll→payer,
+#          G2 roll→issuer, J1 end-lender=payer (C = issuer⇄payer). J1's reuse is deliberate — the
+#          borrower (payer) regains the underlying ONLY if the full 3-level forfeit-forward routes
+#          it all the way back, so payer re-pledging it is a clean end-to-end cascade proof.
+#
+#  Verification: NFT seizure/return ⇒ re-pledge by the expected owner (escrow-at-create reverts
+#  unless owned). Payment seizure ⇒ counterparty claims (accept) + balance gt baseline. Routing
+#  ⇒ functional success (mis-route reverts on-chain). EXPLORATORY scenarios (marked) probe whether
+#  an interaction is supported at all — a failure there is a finding, not necessarily a regression.
+#
+#  Matrix:
+#    G1  roll the OUTER repo (B) of a rehyp chain, then unwind         (roll × rehyp)
+#    G2  roll the INNER repo (A) while Cont_A is pledged in B          (roll × rehyp, EXPLORATORY)
+#    G3  double-default forfeit AFTER an outer roll                    (roll × forfeit-forward)
+#    H1  inner(A) forfeit FIRST while outer(B) still active            (forfeiture order variant)
+#    I1  rehyp of a PAYMENT-collateral repo is REJECTED at re-pledge   (documents unsupported combo)
+#    J1  depth-3 re-rehypothecation, TRIPLE-default cascade            (forfeit-forward recursion)
+#    K1  repurchase routing asserted at the BALANCE level, each level  (routing correctness)
+# ════════════════════════════════════════════════════════════════════════════
+
+commands:
+
+  # ───────────────────────────── FUNDING (only payer/investor/issuer are fundable in the test env) ─────────────────────────────
+  # The 6-decimal fixture seeds public ERC20 to exactly these three (mirroring
+  # deploy_clean.ts INITIAL_RECIPIENTS for the 18-decimal tokens), so every role below —
+  # including roll-in lenders and the depth-3 end-lender — reuses one of them
+  # (a funded party that isn't already in that swap), never a 4th party.
+  - name: fund_payer_aud
+    type: deposit
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { asset_id: aud-token-asset, amount: 1000000000000, idempotency_key: na-fund-payer-aud-$(date +%s) }
+  - name: fund_payer_usdc
+    type: deposit
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { asset_id: usdc-asset, amount: 1000000000000, idempotency_key: na-fund-payer-usdc-$(date +%s) }
+  - name: fund_investor_aud
+    type: deposit
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { asset_id: aud-token-asset, amount: 1000000000000, idempotency_key: na-fund-inv-aud-$(date +%s) }
+  - name: fund_investor_usdc
+    type: deposit
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { asset_id: usdc-asset, amount: 1000000000000, idempotency_key: na-fund-inv-usdc-$(date +%s) }
+  - name: fund_issuer_aud
+    type: deposit
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { asset_id: aud-token-asset, amount: 1000000000000, idempotency_key: na-fund-iss-aud-$(date +%s) }
+  - name: fund_issuer_usdc
+    type: deposit
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { asset_id: usdc-asset, amount: 1000000000000, idempotency_key: na-fund-iss-usdc-$(date +%s) }
+
+
+  # ════════ G1 — ROLL THE OUTER REPO (B) OF A REHYP CHAIN, THEN UNWIND ════════
+  # investor (borrower on B) rolls B to a new lender (collateral); Cont_A must migrate with the
+  # roll so B2 holds it. Then unwind both. No forfeiture ⇒ no chain jump (long deadlines).
+  - name: g1_underlying
+    type: create_obligation
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { idempotency_key: g1-under-$(date +%s), counterpart: payer@yieldfabric.com, expiry: $(date -u -v+90d +%Y-%m-%dT%H:%M:%SZ), contract_id: na_g1_underlying, data: { name: "G1 underlying", description: "outer-roll rehyp" } }
+
+  - name: g1_a_create
+    type: create_swap
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      swap_id: "910001"
+      idempotency_key: g1-a-create-$(date +%s)
+      deadline: $(date -u -v+30d +%Y-%m-%dT%H:%M:%SZ)
+      expiry:   $(date -u -v+60d +%Y-%m-%dT%H:%M:%SZ)
+      initiator:
+        collateral_obligation_ids: [na_g1_underlying]
+        repurchase_payments: { denomination: usdc-asset, amount: 1050000000, payments: [{ id: g1-a-repurch-1 }] }
+      counterparty:
+        id: investor@yieldfabric.com
+        expected_payments: { denomination: aud-token-asset, amount: 1000000000, payments: [{ id: g1-a-cash-1 }] }
+  - name: g1_a_complete
+    type: complete_swap
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { swap_id: "910001", idempotency_key: g1-a-complete-$(date +%s) }
+
+  - name: g1_b_create
+    type: create_swap
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters:
+      swap_id: "910002"
+      idempotency_key: g1-b-create-$(date +%s)
+      deadline: $(date -u -v+30d +%Y-%m-%dT%H:%M:%SZ)
+      expiry:   $(date -u -v+45d +%Y-%m-%dT%H:%M:%SZ)
+      initiator:
+        collateral_contract_references: [{ composed_contract_id: COMPOSED-CONTRACT-REPO-SWAP-910001 }]
+        repurchase_payments: { denomination: aud-token-asset, amount: 1020000000, payments: [{ id: g1-b-repurch-1 }] }
+      counterparty:
+        id: issuer@yieldfabric.com
+        expected_payments: { denomination: aud-token-asset, amount: 1000000000, payments: [{ id: g1-b-cash-1 }] }
+  - name: g1_b_complete
+    type: complete_swap
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { swap_id: "910002", idempotency_key: g1-b-complete-$(date +%s) }
+
+  # investor rolls the OUTER repo B → B2 with a new lender (collateral). Cont_A migrates to B2.
+  - name: g1_b_roll_initiate
+    type: initiate_roll
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters:
+      old_swap_id: "910002"
+      new_swap_id: "910003"
+      new_counterparty: payer@yieldfabric.com
+      new_deadline: $(date -u -v+30d +%Y-%m-%dT%H:%M:%SZ)
+      new_expiry:   $(date -u -v+45d +%Y-%m-%dT%H:%M:%SZ)
+      idempotency_key: g1-b-roll-$(date +%s)
+  - name: g1_b_roll_complete
+    type: complete_roll
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { new_swap_id: "910003", idempotency_key: g1-b-roll-complete-$(date +%s) }
+
+  # unwind: investor repurchases the rolled outer repo B2 (gets Cont_A back), then payer repurchases A
+  - name: g1_b2_repurchase
+    type: repurchase_swap
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { swap_id: "910003", idempotency_key: g1-b2-repurch-$(date +%s) }
+  - name: g1_a_repurchase
+    type: repurchase_swap
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { swap_id: "910001", idempotency_key: g1-a-repurch-$(date +%s) }
+
+  # PROOF: the underlying round-tripped back to payer through the rolled chain
+  - name: g1_verify_payer_owns
+    type: create_swap
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      swap_id: "990001"
+      idempotency_key: g1-verify-$(date +%s)
+      initiator: { obligation_ids: [na_g1_underlying] }
+      counterparty:
+        id: investor@yieldfabric.com
+        expected_payments: { denomination: aud-token-asset, amount: 1000000000, payments: [{ id: g1-verify-want-1 }] }
+      deadline: $(date -u -v+30d +%Y-%m-%dT%H:%M:%SZ)
+
+
+  # ════════ G2 — ROLL THE INNER REPO (A) WHILE Cont_A IS PLEDGED IN B (EXPLORATORY) ════════
+  # payer tries to roll the INNER repo A while its lender position Cont_A is escrowed as collateral
+  # in B. This MAY be supported (roll re-tags + B's collateral tracks A2) or correctly blocked
+  # (rolling a rehypothecated position would orphan B's collateral). Either outcome is a finding;
+  # we attempt it and observe. If g2_a_roll_initiate fails, inner-rehyp rolls aren't supported.
+  - name: g2_underlying
+    type: create_obligation
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { idempotency_key: g2-under-$(date +%s), counterpart: payer@yieldfabric.com, expiry: $(date -u -v+90d +%Y-%m-%dT%H:%M:%SZ), contract_id: na_g2_underlying, data: { name: "G2 underlying", description: "inner-roll rehyp probe" } }
+
+  - name: g2_a_create
+    type: create_swap
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      swap_id: "920001"
+      idempotency_key: g2-a-create-$(date +%s)
+      deadline: $(date -u -v+30d +%Y-%m-%dT%H:%M:%SZ)
+      expiry:   $(date -u -v+60d +%Y-%m-%dT%H:%M:%SZ)
+      initiator:
+        collateral_obligation_ids: [na_g2_underlying]
+        repurchase_payments: { denomination: usdc-asset, amount: 1050000000, payments: [{ id: g2-a-repurch-1 }] }
+      counterparty:
+        id: investor@yieldfabric.com
+        expected_payments: { denomination: aud-token-asset, amount: 1000000000, payments: [{ id: g2-a-cash-1 }] }
+  - name: g2_a_complete
+    type: complete_swap
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { swap_id: "920001", idempotency_key: g2-a-complete-$(date +%s) }
+
+  - name: g2_b_create
+    type: create_swap
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters:
+      swap_id: "920002"
+      idempotency_key: g2-b-create-$(date +%s)
+      deadline: $(date -u -v+30d +%Y-%m-%dT%H:%M:%SZ)
+      expiry:   $(date -u -v+45d +%Y-%m-%dT%H:%M:%SZ)
+      initiator:
+        collateral_contract_references: [{ composed_contract_id: COMPOSED-CONTRACT-REPO-SWAP-920001 }]
+        repurchase_payments: { denomination: aud-token-asset, amount: 1020000000, payments: [{ id: g2-b-repurch-1 }] }
+      counterparty:
+        id: issuer@yieldfabric.com
+        expected_payments: { denomination: aud-token-asset, amount: 1000000000, payments: [{ id: g2-b-cash-1 }] }
+  - name: g2_b_complete
+    type: complete_swap
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { swap_id: "920002", idempotency_key: g2-b-complete-$(date +%s) }
+
+  # EXPLORATORY: roll the inner repo A while Cont_A is collateral in B
+  - name: g2_a_roll_initiate
+    type: initiate_roll
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      old_swap_id: "920001"
+      new_swap_id: "920003"
+      new_counterparty: issuer@yieldfabric.com
+      new_deadline: $(date -u -v+30d +%Y-%m-%dT%H:%M:%SZ)
+      new_expiry:   $(date -u -v+60d +%Y-%m-%dT%H:%M:%SZ)
+      idempotency_key: g2-a-roll-$(date +%s)
+
+
+  # ════════ G3 — DOUBLE-DEFAULT FORFEIT AFTER AN OUTER ROLL ════════
+  # B is rolled to a new lender (collateral); then BOTH default. The forfeit-forward must cascade
+  # Cont_A to the ROLLED-IN lender (collateral), and A's underlying then to that same party.
+  # (First forfeit scenario ⇒ chain jumps begin; growing deadlines from here.)
+  - name: g3_underlying
+    type: create_obligation
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { idempotency_key: g3-under-$(date +%s), counterpart: payer@yieldfabric.com, expiry: $(date -u -v+90d +%Y-%m-%dT%H:%M:%SZ), contract_id: na_g3_underlying, data: { name: "G3 underlying", description: "forfeit after outer roll" } }
+
+  - name: g3_a_create
+    type: create_swap
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      swap_id: "930001"
+      idempotency_key: g3-a-create-$(date +%s)
+      deadline: $(date -u -v+1800S +%Y-%m-%dT%H:%M:%SZ)
+      expiry:   $(date -u -v+2400S +%Y-%m-%dT%H:%M:%SZ)
+      initiator:
+        collateral_obligation_ids: [na_g3_underlying]
+        repurchase_payments: { denomination: usdc-asset, amount: 1050000000, payments: [{ id: g3-a-repurch-1 }] }
+      counterparty:
+        id: investor@yieldfabric.com
+        expected_payments: { denomination: aud-token-asset, amount: 1000000000, payments: [{ id: g3-a-cash-1 }] }
+  - name: g3_a_complete
+    type: complete_swap
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { swap_id: "930001", idempotency_key: g3-a-complete-$(date +%s) }
+
+  - name: g3_b_create
+    type: create_swap
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters:
+      swap_id: "930002"
+      idempotency_key: g3-b-create-$(date +%s)
+      deadline: $(date -u -v+1800S +%Y-%m-%dT%H:%M:%SZ)
+      expiry:   $(date -u -v+2400S +%Y-%m-%dT%H:%M:%SZ)
+      initiator:
+        collateral_contract_references: [{ composed_contract_id: COMPOSED-CONTRACT-REPO-SWAP-930001 }]
+        repurchase_payments: { denomination: aud-token-asset, amount: 1020000000, payments: [{ id: g3-b-repurch-1 }] }
+      counterparty:
+        id: issuer@yieldfabric.com
+        expected_payments: { denomination: aud-token-asset, amount: 1000000000, payments: [{ id: g3-b-cash-1 }] }
+  - name: g3_b_complete
+    type: complete_swap
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { swap_id: "930002", idempotency_key: g3-b-complete-$(date +%s) }
+
+  # roll B → B2 (new lender = payer, a funded party not in B) BEFORE expiry
+  - name: g3_b_roll_initiate
+    type: initiate_roll
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters:
+      old_swap_id: "930002"
+      new_swap_id: "930003"
+      new_counterparty: payer@yieldfabric.com
+      new_deadline: $(date -u -v+1800S +%Y-%m-%dT%H:%M:%SZ)
+      new_expiry:   $(date -u -v+2400S +%Y-%m-%dT%H:%M:%SZ)
+      idempotency_key: g3-b-roll-$(date +%s)
+  - name: g3_b_roll_complete
+    type: complete_roll
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { new_swap_id: "930003", idempotency_key: g3-b-roll-complete-$(date +%s) }
+
+  - name: g3_wait_expiry
+    type: advance_chain_time
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { seconds: 3000 }
+
+  # double default: forfeit rolled B2 (Cont_A → collateral), then forfeit A (underlying → collateral)
+  - name: g3_b2_forfeit
+    type: expire_collateral
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { swap_id: "930003", idempotency_key: g3-b2-forfeit-$(date +%s) }
+  - name: g3_a_forfeit
+    type: expire_collateral
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { swap_id: "930001", idempotency_key: g3-a-forfeit-$(date +%s) }
+
+  # PROOF: the underlying cascaded to the rolled-in end-lender (payer, B2's lender)
+  - name: g3_verify_payer_owns
+    type: create_swap
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      swap_id: "990003"
+      idempotency_key: g3-verify-$(date +%s)
+      initiator: { obligation_ids: [na_g3_underlying] }
+      counterparty:
+        id: investor@yieldfabric.com
+        expected_payments: { denomination: aud-token-asset, amount: 1000000000, payments: [{ id: g3-verify-want-1 }] }
+      deadline: $(date -u -v+30d +%Y-%m-%dT%H:%M:%SZ)
+
+
+  # ════════ H1 — INNER(A) FORFEIT FIRST, WHILE OUTER(B) STILL ACTIVE (order variant) ════════
+  # A expires first while Cont_A is still escrowed in the active B. Forfeiting A: where does the
+  # underlying go — to the Cont_A holder, which is the B-swap escrow? Then B forfeits → issuer.
+  # EXPLORATORY ordering: the "skip Col_A / inner stays with original parties" logic is order-sensitive.
+  - name: h1_underlying
+    type: create_obligation
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { idempotency_key: h1-under-$(date +%s), counterpart: payer@yieldfabric.com, expiry: $(date -u -v+90d +%Y-%m-%dT%H:%M:%SZ), contract_id: na_h1_underlying, data: { name: "H1 underlying", description: "inner-forfeit-first order variant" } }
+
+  # A: SHORT expiry (forfeited first).  B: LONGER expiry (forfeited after).
+  - name: h1_a_create
+    type: create_swap
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      swap_id: "940001"
+      idempotency_key: h1-a-create-$(date +%s)
+      deadline: $(date -u -v+5400S +%Y-%m-%dT%H:%M:%SZ)
+      expiry:   $(date -u -v+6000S +%Y-%m-%dT%H:%M:%SZ)
+      initiator:
+        collateral_obligation_ids: [na_h1_underlying]
+        repurchase_payments: { denomination: usdc-asset, amount: 1050000000, payments: [{ id: h1-a-repurch-1 }] }
+      counterparty:
+        id: investor@yieldfabric.com
+        expected_payments: { denomination: aud-token-asset, amount: 1000000000, payments: [{ id: h1-a-cash-1 }] }
+  - name: h1_a_complete
+    type: complete_swap
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { swap_id: "940001", idempotency_key: h1-a-complete-$(date +%s) }
+
+  - name: h1_b_create
+    type: create_swap
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters:
+      swap_id: "940002"
+      idempotency_key: h1-b-create-$(date +%s)
+      deadline: $(date -u -v+5400S +%Y-%m-%dT%H:%M:%SZ)
+      expiry:   $(date -u -v+7200S +%Y-%m-%dT%H:%M:%SZ)
+      initiator:
+        collateral_contract_references: [{ composed_contract_id: COMPOSED-CONTRACT-REPO-SWAP-940001 }]
+        repurchase_payments: { denomination: aud-token-asset, amount: 1020000000, payments: [{ id: h1-b-repurch-1 }] }
+      counterparty:
+        id: issuer@yieldfabric.com
+        expected_payments: { denomination: aud-token-asset, amount: 1000000000, payments: [{ id: h1-b-cash-1 }] }
+  - name: h1_b_complete
+    type: complete_swap
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { swap_id: "940002", idempotency_key: h1-b-complete-$(date +%s) }
+
+  - name: h1_wait_a_expiry
+    type: advance_chain_time
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { seconds: 3500 }
+
+  # forfeit A FIRST — at chain ~6500: A expiry(6000) passed, B expiry(7200) NOT ⇒ B still active
+  - name: h1_a_forfeit
+    type: expire_collateral
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { swap_id: "940001", idempotency_key: h1-a-forfeit-$(date +%s) }
+  # now expire B too (second jump past B's 7200s expiry) and forfeit it
+  - name: h1_wait_b_expiry
+    type: advance_chain_time
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { seconds: 1500 }
+  - name: h1_b_forfeit
+    type: expire_collateral
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { swap_id: "940002", idempotency_key: h1-b-forfeit-$(date +%s) }
+
+  # PROOF (order finding): when the INNER repo defaults FIRST (outer still active), the underlying
+  # goes to A's OWN lender (investor), NOT the end-lender (issuer) — the inner forfeit detaches
+  # Cont_A from the rehyp parent and forfeit-forwards 0 assets, so issuer's claim on Cont_A is
+  # correspondingly devalued (a real rehypothecation risk worth noting). investor re-pledging proves
+  # it landed there.
+  - name: h1_verify_investor_owns
+    type: create_swap
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters:
+      swap_id: "990004"
+      idempotency_key: h1-verify-$(date +%s)
+      initiator: { obligation_ids: [na_h1_underlying] }
+      counterparty:
+        id: payer@yieldfabric.com
+        expected_payments: { denomination: aud-token-asset, amount: 1000000000, payments: [{ id: h1-verify-want-1 }] }
+      deadline: $(date -u -v+30d +%Y-%m-%dT%H:%M:%SZ)
+
+
+  # ════════ I1 — REHYP OF A PAYMENT-COLLATERAL REPO (via the repurchase obligation) — #68 FIXED ════════
+  # Build a repo A whose underlying collateral is a PAYMENT (USDC), then rehypothecate it (re-pledge
+  # Cont_A into B). A payment-collateral position has no collateral NFT, so the re-pledge resolves the
+  # repurchase-obligation NFT (the lender's claim — the cash collateral forfeit-forwards to it).
+  # Previously REJECTED ("No token associated"); #68 (contract_types.rs::resolve_contract_ids now skips
+  # the tokenless payment-collateral child) makes the re-pledge SUCCEED and Repo B form over it.
+  - name: i1_a_create
+    type: create_swap
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      swap_id: "950001"
+      idempotency_key: i1-a-create-$(date +%s)
+      deadline: $(date -u -v+9000S +%Y-%m-%dT%H:%M:%SZ)
+      expiry:   $(date -u -v+9600S +%Y-%m-%dT%H:%M:%SZ)
+      initiator:
+        collateral_payments: { denomination: usdc-asset, amount: 500000000, payments: [{ id: i1-a-collat-1 }] }
+        repurchase_payments: { denomination: usdc-asset, amount: 1050000000, payments: [{ id: i1-a-repurch-1 }] }
+      counterparty:
+        id: investor@yieldfabric.com
+        expected_payments: { denomination: aud-token-asset, amount: 1000000000, payments: [{ id: i1-a-cash-1 }] }
+  - name: i1_a_complete
+    type: complete_swap
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { swap_id: "950001", idempotency_key: i1-a-complete-$(date +%s) }
+
+  # #68 FIXED: re-pledging a PAYMENT-collateral position used to be REJECTED ("No token associated with
+  # CONTRACT-COLLATERAL-PAYMENT-…") because that sub-contract has no NFT token until forfeit. The
+  # re-pledge now skips the tokenless child and pledges the repurchase-obligation NFT, so this create
+  # SUCCEEDS and Repo B forms over the payment-collateral position. (Requires the rebuilt payments service.)
+  - name: i1_b_create_rehyp_payment
+    type: create_swap
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters:
+      swap_id: "950002"
+      idempotency_key: i1-b-create-$(date +%s)
+      deadline: $(date -u -v+30d +%Y-%m-%dT%H:%M:%SZ)
+      expiry:   $(date -u -v+45d +%Y-%m-%dT%H:%M:%SZ)
+      initiator:
+        collateral_contract_references: [{ composed_contract_id: COMPOSED-CONTRACT-REPO-SWAP-950001 }]
+        repurchase_payments: { denomination: aud-token-asset, amount: 1020000000, payments: [{ id: i1-b-repurch-1 }] }
+      counterparty:
+        id: issuer@yieldfabric.com
+        expected_payments: { denomination: aud-token-asset, amount: 1000000000, payments: [{ id: i1-b-cash-1 }] }
+  - name: i1_b_complete
+    type: complete_swap
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { swap_id: "950002", idempotency_key: i1-b-complete-$(date +%s) }
+
+
+  # ════════ J1 — DEPTH-3 RE-REHYPOTHECATION, TRIPLE-DEFAULT CASCADE ════════
+  # underlying → A(payer⇄investor) → Cont_A → B(investor⇄issuer) → Cont_B → C(issuer⇄collateral).
+  # All three default. The underlying must cascade through ALL THREE levels to the end-lender
+  # (collateral). Tests forfeit-forward recursion beyond depth 2.
+  - name: j1_underlying
+    type: create_obligation
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { idempotency_key: j1-under-$(date +%s), counterpart: payer@yieldfabric.com, expiry: $(date -u -v+90d +%Y-%m-%dT%H:%M:%SZ), contract_id: na_j1_underlying, data: { name: "J1 underlying", description: "depth-3 cascade" } }
+
+  - name: j1_a_create
+    type: create_swap
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      swap_id: "960001"
+      idempotency_key: j1-a-create-$(date +%s)
+      deadline: $(date -u -v+10000S +%Y-%m-%dT%H:%M:%SZ)
+      expiry:   $(date -u -v+10600S +%Y-%m-%dT%H:%M:%SZ)
+      initiator:
+        collateral_obligation_ids: [na_j1_underlying]
+        repurchase_payments: { denomination: usdc-asset, amount: 1050000000, payments: [{ id: j1-a-repurch-1 }] }
+      counterparty:
+        id: investor@yieldfabric.com
+        expected_payments: { denomination: aud-token-asset, amount: 1000000000, payments: [{ id: j1-a-cash-1 }] }
+  - name: j1_a_complete
+    type: complete_swap
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { swap_id: "960001", idempotency_key: j1-a-complete-$(date +%s) }
+
+  - name: j1_b_create
+    type: create_swap
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters:
+      swap_id: "960002"
+      idempotency_key: j1-b-create-$(date +%s)
+      deadline: $(date -u -v+10000S +%Y-%m-%dT%H:%M:%SZ)
+      expiry:   $(date -u -v+10600S +%Y-%m-%dT%H:%M:%SZ)
+      initiator:
+        collateral_contract_references: [{ composed_contract_id: COMPOSED-CONTRACT-REPO-SWAP-960001 }]
+        repurchase_payments: { denomination: aud-token-asset, amount: 1020000000, payments: [{ id: j1-b-repurch-1 }] }
+      counterparty:
+        id: issuer@yieldfabric.com
+        expected_payments: { denomination: aud-token-asset, amount: 1000000000, payments: [{ id: j1-b-cash-1 }] }
+  - name: j1_b_complete
+    type: complete_swap
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { swap_id: "960002", idempotency_key: j1-b-complete-$(date +%s) }
+
+  # C: issuer re-pledges Cont_B (= COMPOSED-CONTRACT-REPO-SWAP-960002) to the level-3 lender (collateral)
+  - name: j1_c_create
+    type: create_swap
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      swap_id: "960003"
+      idempotency_key: j1-c-create-$(date +%s)
+      deadline: $(date -u -v+10000S +%Y-%m-%dT%H:%M:%SZ)
+      expiry:   $(date -u -v+10600S +%Y-%m-%dT%H:%M:%SZ)
+      initiator:
+        collateral_contract_references: [{ composed_contract_id: COMPOSED-CONTRACT-REPO-SWAP-960002 }]
+        repurchase_payments: { denomination: aud-token-asset, amount: 1010000000, payments: [{ id: j1-c-repurch-1 }] }
+      counterparty:
+        id: payer@yieldfabric.com
+        expected_payments: { denomination: aud-token-asset, amount: 1000000000, payments: [{ id: j1-c-cash-1 }] }
+  - name: j1_c_complete
+    type: complete_swap
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { swap_id: "960003", idempotency_key: j1-c-complete-$(date +%s) }
+
+  - name: j1_wait_expiry
+    type: advance_chain_time
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { seconds: 3500 }
+
+  # triple default, outermost-in: C forfeit (Cont_B → collateral), B forfeit (Cont_A → collateral), A forfeit (underlying → collateral)
+  - name: j1_c_forfeit
+    type: expire_collateral
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { swap_id: "960003", idempotency_key: j1-c-forfeit-$(date +%s) }
+  - name: j1_b_forfeit
+    type: expire_collateral
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { swap_id: "960002", idempotency_key: j1-b-forfeit-$(date +%s) }
+  - name: j1_a_forfeit
+    type: expire_collateral
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { swap_id: "960001", idempotency_key: j1-a-forfeit-$(date +%s) }
+
+  # PROOF: the underlying cascaded through all 3 levels to the end-lender (payer, C's lender)
+  - name: j1_verify_payer_owns
+    type: create_swap
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      swap_id: "990006"
+      idempotency_key: j1-verify-$(date +%s)
+      initiator: { obligation_ids: [na_j1_underlying] }
+      counterparty:
+        id: investor@yieldfabric.com
+        expected_payments: { denomination: aud-token-asset, amount: 1000000000, payments: [{ id: j1-verify-want-1 }] }
+      deadline: $(date -u -v+30d +%Y-%m-%dT%H:%M:%SZ)
+
+
+  # ════════ K1 — REPURCHASE ROUTING ASSERTED AT THE BALANCE LEVEL ════════
+  # Beyond "repurchase succeeds": prove the repurchase cash actually lands with the lender at each
+  # level. payer repurchases A (1050 USDC) → the lender-A position holder (investor) claims it →
+  # investor's USDC must rise. Payment-collateral-free repo; pull-based repurchase claim like forfeit.
+  - name: k1_underlying
+    type: create_obligation
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { idempotency_key: k1-under-$(date +%s), counterpart: payer@yieldfabric.com, expiry: $(date -u -v+90d +%Y-%m-%dT%H:%M:%SZ), contract_id: na_k1_underlying, data: { name: "K1 underlying", description: "balance-asserted repurchase routing" } }
+
+  - name: k1_a_create
+    type: create_swap
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      swap_id: "970001"
+      idempotency_key: k1-a-create-$(date +%s)
+      deadline: $(date -u -v+30d +%Y-%m-%dT%H:%M:%SZ)
+      expiry:   $(date -u -v+60d +%Y-%m-%dT%H:%M:%SZ)
+      initiator:
+        collateral_obligation_ids: [na_k1_underlying]
+        repurchase_payments: { denomination: usdc-asset, amount: 1050000000, payments: [{ id: k1-a-repurch-1 }] }
+      counterparty:
+        id: investor@yieldfabric.com
+        expected_payments: { denomination: aud-token-asset, amount: 1000000000, payments: [{ id: k1-a-cash-1 }] }
+  - name: k1_a_complete
+    type: complete_swap
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { swap_id: "970001", idempotency_key: k1-a-complete-$(date +%s) }
+
+  # A is STANDALONE = the outermost level, so its repurchase cash is freely claimable by the lender.
+  # The repurchase pays 1050 USDC from payer → investor; capture investor's USDC before/after.
+  - name: k1_investor_usdc_before
+    type: balance
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { asset_id: usdc-asset }
+
+  - name: k1_a_repurchase
+    type: repurchase_swap
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { swap_id: "970001", idempotency_key: k1-a-repurch-$(date +%s) }
+
+  # CORRECTED RECORD (the earlier draft claimed the wrong id). The actual repurchase-cash record is
+  # PAY-REPURCHASE-<swap>-<index> — created by the repurchase post-processor
+  # (repurchase_swap_processor.rs:917) with the on-chain id_hash from the vault's confidential send
+  # (repurchase.rs:476, which ERRORS if the hash list is empty). The id I claimed before,
+  # PAY-REPURCHASE-OBLIGATION-970001-0, is a PLACEHOLDER minted at complete time
+  # (complete_swap_processor/repurchase.rs:657 with id_hash 0x0, comment "Placeholder - updated on
+  # repurchase") — accepting it correctly returns "Amount not found", which is NOT a delivery gap.
+  # This step is now a real POSITIVE test: investor claims the cash and the balance must rise. If this
+  # accept fails with "Amount not found", THAT is a real (correctly-targeted) delivery bug to chase.
+  - name: k1_lender_claim_repurchase_cash
+    type: accept
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { payment_id: PAY-REPURCHASE-970001-0, idempotency_key: k1-claim-$(date +%s) }
+
+  - name: k1_investor_usdc_after
+    type: balance
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { asset_id: usdc-asset }
+  - name: k1_assert_repurchase_received
+    type: assert
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters:
+      # EXACT: k1_a (970001) repurchase = 1050 USDC; the lender (investor) claims exactly that.
+      actual: "$k1_investor_usdc_after.private_balance"
+      minus: "$k1_investor_usdc_before.private_balance"
+      equals: "1050000000"
+
+  # ════════ L — REPURCHASE-CASH CASCADE (repo_1 → repo_2 → repo_3) ════════
+  # Definitive test of the rehyp cash model with the CORRECT records. Model (by design): repurchase is
+  # allowed at every level, but cash paid into an INNER repo is locked as collateral up the chain
+  # (repo_N's position is collateral in repo_N+1), so only the OUTERMOST repo's repurchase cash is
+  # freely claimable by the end-lender. Same 3 funded parties, circular:
+  #   repo_1 payer⇄investor → repo_2 investor⇄issuer → repo_3 issuer⇄payer  (end-lender = payer).
+  - name: l_underlying
+    type: create_obligation
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { idempotency_key: l-under-$(date +%s), counterpart: payer@yieldfabric.com, expiry: $(date -u -v+90d +%Y-%m-%dT%H:%M:%SZ), contract_id: na_l_underlying, data: { name: "L underlying", description: "repurchase cascade" } }
+
+  # repo_1: payer borrows from investor against the underlying; owes 1050 USDC repurchase.
+  - name: l_repo1_create
+    type: create_swap
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      swap_id: "980001"
+      idempotency_key: l-r1-create-$(date +%s)
+      deadline: $(date -u -v+30d +%Y-%m-%dT%H:%M:%SZ)
+      expiry:   $(date -u -v+60d +%Y-%m-%dT%H:%M:%SZ)
+      initiator:
+        collateral_obligation_ids: [na_l_underlying]
+        repurchase_payments: { denomination: usdc-asset, amount: 1050000000, payments: [{ id: l-r1-repurch-1 }] }
+      counterparty:
+        id: investor@yieldfabric.com
+        expected_payments: { denomination: aud-token-asset, amount: 1000000000, payments: [{ id: l-r1-cash-1 }] }
+  - name: l_repo1_complete
+    type: complete_swap
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { swap_id: "980001", idempotency_key: l-r1-complete-$(date +%s) }
+
+  # repo_2: investor re-pledges Cont_1 (= COMPOSED-CONTRACT-REPO-SWAP-980001) to issuer; owes 1020 AUD.
+  - name: l_repo2_create
+    type: create_swap
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters:
+      swap_id: "980002"
+      idempotency_key: l-r2-create-$(date +%s)
+      deadline: $(date -u -v+30d +%Y-%m-%dT%H:%M:%SZ)
+      expiry:   $(date -u -v+60d +%Y-%m-%dT%H:%M:%SZ)
+      initiator:
+        collateral_contract_references: [{ composed_contract_id: COMPOSED-CONTRACT-REPO-SWAP-980001 }]
+        repurchase_payments: { denomination: aud-token-asset, amount: 1020000000, payments: [{ id: l-r2-repurch-1 }] }
+      counterparty:
+        id: issuer@yieldfabric.com
+        expected_payments: { denomination: aud-token-asset, amount: 1000000000, payments: [{ id: l-r2-cash-1 }] }
+  - name: l_repo2_complete
+    type: complete_swap
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { swap_id: "980002", idempotency_key: l-r2-complete-$(date +%s) }
+
+  # repo_3 (OUTERMOST): issuer re-pledges Cont_2 (= COMPOSED-CONTRACT-REPO-SWAP-980002) to payer; owes 1010 AUD.
+  - name: l_repo3_create
+    type: create_swap
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters:
+      swap_id: "980003"
+      idempotency_key: l-r3-create-$(date +%s)
+      deadline: $(date -u -v+30d +%Y-%m-%dT%H:%M:%SZ)
+      expiry:   $(date -u -v+60d +%Y-%m-%dT%H:%M:%SZ)
+      initiator:
+        collateral_contract_references: [{ composed_contract_id: COMPOSED-CONTRACT-REPO-SWAP-980002 }]
+        repurchase_payments: { denomination: aud-token-asset, amount: 1010000000, payments: [{ id: l-r3-repurch-1 }] }
+      counterparty:
+        id: payer@yieldfabric.com
+        expected_payments: { denomination: aud-token-asset, amount: 1000000000, payments: [{ id: l-r3-cash-1 }] }
+  - name: l_repo3_complete
+    type: complete_swap
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { swap_id: "980003", idempotency_key: l-r3-complete-$(date +%s) }
+
+  # ── PRIMARY: OUTERMOST repurchase cash IS claimable by the end-lender (payer). ──
+  # issuer repurchases repo_3 → pays 1010 AUD to payer; payer claims PAY-REPURCHASE-980003-0 and the
+  # balance must rise. This is the clean, on-intact-chain proof of outermost delivery — the question K1
+  # was meant to answer (now with the correct record id).
+  - name: l_payer_aud_before
+    type: balance
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { asset_id: aud-token-asset }
+  - name: l_repo3_repurchase
+    type: repurchase_swap
+    user: { id: issuer@yieldfabric.com, password: issuer_password }
+    parameters: { swap_id: "980003", idempotency_key: l-r3-repurch-$(date +%s) }
+  - name: l_payer_claim_outermost
+    type: accept
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { payment_id: PAY-REPURCHASE-980003-0, idempotency_key: l-r3-claim-$(date +%s) }
+  - name: l_payer_aud_after
+    type: balance
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { asset_id: aud-token-asset }
+  - name: l_assert_outermost_received
+    type: assert
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters:
+      # EXACT: outermost repo_3 (980003) repurchase = 1010 AUD; the end-lender (payer) claims exactly that.
+      actual: "$l_payer_aud_after.private_balance"
+      minus: "$l_payer_aud_before.private_balance"
+      equals: "1010000000"
+
+  # ── PROBE: INNER repurchase cash is LOCKED (collateral up the chain). ──
+  # repo_2 is still ACTIVE (holding Cont_1 as collateral). payer repurchases repo_1 — allowed per the
+  # model ("repurchase the collateral in 1, 2 and 3") — but the resulting cash is locked as collateral
+  # for repo_2, so investor must NOT be able to freely claim PAY-REPURCHASE-980001-0 yet. expect_failure
+  # confirms the lock; if this accept SUCCEEDS, the model isn't being enforced (a real finding). If
+  # l_repo1_repurchase itself reverts, that contradicts "repurchase allowed while nested" — also a finding.
+  # STRENGTHENED: snapshot investor's USDC around the repurchase+blocked-claim and assert it did NOT rise.
+  # The bare expect_failure only proved "the accept threw"; this proves the *cash was paid into repo_1 yet
+  # never reached the inner lender* — the actual lock invariant. (Together: the claim reverts AND the
+  # inner lender's balance is unchanged.)
+  - name: l_investor_usdc_before_lock
+    type: balance
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { asset_id: usdc-asset }
+  - name: l_repo1_repurchase
+    type: repurchase_swap
+    user: { id: payer@yieldfabric.com, password: payer_password }
+    parameters: { swap_id: "980001", idempotency_key: l-r1-repurch-$(date +%s) }
+  - name: l_repo1_cash_locked
+    type: accept
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters:
+      payment_id: PAY-REPURCHASE-980001-0
+      idempotency_key: l-r1-claim-$(date +%s)
+      expect_failure: true
+      # NO expect_error ON PURPOSE. The run showed the lock is enforced STRUCTURALLY, not via the clean
+      # lock revert I predicted (Vault.sol:511). By re-pledging Cont_1 into repo_2, investor is no longer
+      # the HOLDER of repo_1's lender claim (log: "Excluding CONTRACT-REPURCHASE-OBLIGATION-980001 … is
+      # not the HOLDER"), so repo_1's repurchase cash cascades UP to repo_2 and investor's accept reverts
+      # "Nonce don't match" (not the current recipient) — the SAME generic ZK-proof revert a BROKEN
+      # retrieve produces. Pinning it would conflate "correctly locked" with "retrieve regressed" → false
+      # signal. The authoritative lock proof is l_assert_inner_cash_locked (delta==0) below.
+  - name: l_investor_usdc_after_lock
+    type: balance
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters: { asset_id: usdc-asset }
+  - name: l_assert_inner_cash_locked
+    type: assert
+    user: { id: investor@yieldfabric.com, password: investor_password }
+    parameters:
+      # The locked inner repurchase cash must NOT have reached the inner lender (investor).
+      actual: "$l_investor_usdc_after_lock.private_balance"
+      minus: "$l_investor_usdc_before_lock.private_balance"
+      equals: "0"

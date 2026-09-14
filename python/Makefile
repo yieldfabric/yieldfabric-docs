@@ -1,7 +1,7 @@
 # YieldFabric Python Port — Makefile
 # Common operations for development and testing.
 
-.PHONY: help install install-dev test test-e2e test-coverage clean format lint type-check version
+.PHONY: help install install-dev test test-unit test-e2e test-coverage clean format lint type-check version yf-help
 
 help:
 	@echo "YieldFabric Python — Available Commands"
@@ -13,6 +13,7 @@ help:
 	@echo ""
 	@echo "Testing:"
 	@echo "  test           Run all tests (pytest; skips E2E if backend is down)"
+	@echo "  test-unit      Run the offline unit tests only (tests/test_unit — incl. the yf CLI)"
 	@echo "  test-e2e       Run ONLY the localhost E2E flow tests"
 	@echo "  test-coverage  Run tests with coverage report (html + term)"
 	@echo ""
@@ -26,6 +27,7 @@ help:
 	@echo "  setup          Run system bootstrap against scripts/setup.yaml"
 	@echo "                 (python -m yieldfabric.cli setup ../scripts/setup.yaml)"
 	@echo "  execute FILE=<path>  Execute a commands YAML file"
+	@echo "  yf-help        Show the yf command-line client's help"
 	@echo ""
 	@echo "Utilities:"
 	@echo "  clean          Clean build artifacts + pycache"
@@ -41,14 +43,25 @@ install-dev:
 
 # ---- Testing ---------------------------------------------------------------
 
+# `PYTHON` is the interpreter that has pytest + requests installed. On a Mac
+# with a bare Homebrew python3, that is often the system one:
+#   make test-unit PYTHON=/usr/bin/python3
+PYTHON ?= python3
+
+# `..` (the yieldfabric-docs checkout) is on PYTHONPATH because one unit test
+# imports the sibling `loan_management` package; without it pytest errors at
+# collection.
 test:
-	PYTHONPATH=. pytest
+	PYTHONPATH=.:.. $(PYTHON) -m pytest
+
+test-unit:
+	PYTHONPATH=.:.. $(PYTHON) -m pytest tests/test_unit -q
 
 test-e2e:
-	PYTHONPATH=. pytest tests/test_e2e/ -v
+	PYTHONPATH=.:.. $(PYTHON) -m pytest tests/test_e2e/ -v
 
 test-coverage:
-	PYTHONPATH=. pytest --cov=yieldfabric --cov-report=html --cov-report=term
+	PYTHONPATH=.:.. $(PYTHON) -m pytest --cov=yieldfabric --cov-report=html --cov-report=term
 
 # ---- Code quality ----------------------------------------------------------
 
@@ -75,6 +88,10 @@ setup:
 execute:
 	@test -n "$(FILE)" || (echo "usage: make execute FILE=<path-to-yaml>" && exit 1)
 	PYTHONPATH=. python -m yieldfabric.cli execute $(FILE)
+
+# `make yf-help` — the command-line client without installing the package.
+yf-help:
+	PYTHONPATH=. $(PYTHON) -m yieldfabric.yf.main --help
 
 # ---- Utilities -------------------------------------------------------------
 

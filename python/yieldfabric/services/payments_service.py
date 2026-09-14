@@ -361,6 +361,23 @@ class PaymentsService(BaseServiceClient):
             self.logger.debug(f"get_user_message({message_id}) failed: {e}")
             return None
 
+    def get_user_message_result(self, user_id: str, message_id: str, token: str) -> Dict[str, Any]:
+        """
+        ``GET /api/users/{user_id}/messages/{message_id}`` with the HTTP
+        outcome preserved: ``{ok, status_code, body}``, never raises.
+
+        ``get_user_message`` above folds 401/403/404 and transport failures
+        into ``None``, which is right for a poll loop but hides WHY a
+        message is unobservable. Callers that must tell "unknown id" (404)
+        from "credential rejected" (401/403) from "host unreachable"
+        (``status_code == 0``) use this variant.
+        """
+        return self._request_json_safe(
+            "GET",
+            f"/api/users/{user_id}/messages/{message_id}",
+            token=token,
+        )
+
     def get_unsigned_transaction(
         self, user_id: str, message_id: str, token: str
     ) -> Optional[dict]:
@@ -631,6 +648,7 @@ class PaymentsService(BaseServiceClient):
         *,
         interval: float = 2.0,
         timeout: float = 300.0,
+        probe: Optional[Callable[[], Optional[dict]]] = None,
     ) -> PollResult[dict]:
         """
         Poll `/api/users/{user_id}/messages/{message_id}` until the
@@ -641,10 +659,22 @@ class PaymentsService(BaseServiceClient):
         Dependent flows must wait until the backend reports graph
         post-processing done, otherwise a fast follow-up command can race
         newly-created swap/payment/contract rows.
+
+        ``probe`` replaces the default observation (``get_user_message``,
+        which swallows every HTTP error) with the caller's own — e.g. one
+        built on ``get_user_message_result`` that raises when the bearer is
+        rejected mid-poll instead of spinning until the timeout. It must
+        return the message record (or ``None`` / ``{}`` for "nothing
+        observable yet"); the completion predicate is unchanged.
         """
 
+        def _default_probe() -> Optional[dict]:
+            return self.get_user_message(user_id, message_id, self._token_value(token))
+
+        observe = probe or _default_probe
+
         def _probe() -> dict:
-            return self.get_user_message(user_id, message_id, self._token_value(token)) or {}
+            return observe() or {}
 
         def _done(obs: dict) -> bool:
             if not obs.get("executed"):

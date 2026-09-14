@@ -1,0 +1,14 @@
+tokens:
+  - id: AUDF
+    name: AUDF Token
+    description: AUDF Stablecoin Token
+    address: 0xd2a530170D71a9Cfe1651Fb468E2B98F7Ed7456b
+    chain_id: 151
+
+assets:
+  - id: AUDF
+    name: AUDF
+    type: Cash
+    currency: AUD
+    description: AUDF Stablecoin Token
+    token_id: AUDF-token

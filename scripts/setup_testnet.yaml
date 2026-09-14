@@ -48,29 +48,29 @@ tokens:
   - id: AUD
     name: AUD Token
     description: AUD Token Description
-    address: 0x17B8eF3C6b81740E9331E9D542608268E7152a33
+    address: 0x3edC356100CE4B5D627783c2f1400D2374E516A4
     chain_id: 153
 
-  - id: USDC
-    name: USDC Token
-    description: USDC Token Description
-    address: 0x3fFA4485a1998d8dE110d7CbDE222c66A251E35a
-    chain_id: 153
+  # - id: USDC
+  #   name: USDC Token
+  #   description: USDC Token Description
+  #   address: 0x3fFA4485a1998d8dE110d7CbDE222c66A251E35a
+  #   chain_id: 153
 
 assets:
   - id: AUD
-    name: AUD Token
+    name: AUD
     type: Cash
     currency: AUD
     description: AUD Token Description
     token_id: AUD-token
     
-  - id: USDC
-    name: USDC
-    type: Cash
-    currency: USD
-    description: USDC Token Description
-    token_id: USDC-token
+  # - id: USDC
+  #   name: USDC
+  #   type: Cash
+  #   currency: USD
+  #   description: USDC Token Description
+  #   token_id: USDC-token
 
 # fiat_accounts:
 #   - id: AUDBANK-001

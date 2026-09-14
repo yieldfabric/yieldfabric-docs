@@ -14,7 +14,7 @@ presented bearer before any resolver runs, so every call here carries the
 caller's user JWT in the Authorization header (handled by `_post`).
 """
 
-from typing import Any, Callable, Dict, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from .base import BaseServiceClient
 from ..config import YieldFabricConfig
@@ -209,4 +209,96 @@ class AgentsService(BaseServiceClient):
                 "to reach a terminal state"
             ),
             on_tick=_tick,
+        )
+
+    # ------------------------------------------------------------------
+    # Knowledge documents (REST). Both calls go through
+    # `_request_json_safe` so the HTTP status survives: a 401/403 is a
+    # credential problem the caller must surface, not a "no results".
+    # ------------------------------------------------------------------
+
+    def count_documents(
+        self,
+        token: str,
+        *,
+        working_group_id: str,
+        terms: List[Dict[str, Any]],
+        kg_ids: Optional[List[str]] = None,
+        as_of: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        POST /knowledge/documents/count — exhaustive per-term tallies over
+        a workspace corpus.
+
+        ``terms`` is a list of ``{"term": str, "mode"?: exact|phrase|fuzzy}``
+        (``exact`` when omitted). ``kg_ids`` omitted searches the whole
+        workspace; an explicit empty list matches nothing. ``as_of`` pins
+        the count to a corpus state (RFC 3339).
+
+        Returns ``{ok, status_code, body}``; on success ``body`` is
+        ``{as_of, terms[{term, mode, frames, frames_capped, documents,
+        documents_capped, ...}], union_documents, union_capped, frame_cap,
+        document_cap}``. A capped figure is a floor, never a rank.
+        """
+        payload: Dict[str, Any] = {
+            "working_group_id": working_group_id,
+            "terms": terms,
+        }
+        if kg_ids is not None:
+            payload["kg_ids"] = kg_ids
+        if as_of:
+            payload["as_of"] = as_of
+        return self._request_json_safe(
+            "POST", "/knowledge/documents/count", token=token, data=payload
+        )
+
+    def retrieve_documents(
+        self,
+        token: str,
+        *,
+        working_group_id: str,
+        query: str,
+        kg_ids: Optional[List[str]] = None,
+        set_id: Optional[str] = None,
+        include_document_ids: Optional[List[str]] = None,
+        exclude_document_ids: Optional[List[str]] = None,
+        top_k: Optional[int] = None,
+        min_score: Optional[float] = None,
+        document_types: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        as_of: Optional[str] = None,
+        effort: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        POST /knowledge/documents/retrieve — ranked passages (no
+        synthesis) scoped to one workspace.
+
+        ``kg_ids`` and ``set_id`` are mutually exclusive scope narrowings;
+        omitting both searches the whole workspace. Returns
+        ``{ok, status_code, body}``; on success ``body`` is
+        ``{query, results[], lanes{vector_degraded, keyword_degraded,
+        graph_degraded, any_degraded, effort, ...}}`` — read ``lanes``
+        before presenting the results as everything the corpus holds.
+        """
+        payload: Dict[str, Any] = {
+            "working_group_id": working_group_id,
+            "query": query,
+        }
+        optional = {
+            "kg_ids": kg_ids,
+            "set_id": set_id,
+            "include_document_ids": include_document_ids,
+            "exclude_document_ids": exclude_document_ids,
+            "top_k": top_k,
+            "min_score": min_score,
+            "document_types": document_types,
+            "tags": tags,
+            "as_of": as_of,
+            "effort": effort,
+        }
+        for key, value in optional.items():
+            if value is not None:
+                payload[key] = value
+        return self._request_json_safe(
+            "POST", "/knowledge/documents/retrieve", token=token, data=payload
         )

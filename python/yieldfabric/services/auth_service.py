@@ -3,11 +3,12 @@ Auth service client
 """
 
 import time
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from .base import BaseServiceClient
 from ..config import YieldFabricConfig
 from ..utils.jwt import extract_claim
+from ..utils.redact import redact_secrets
 
 
 class AuthService(BaseServiceClient):
@@ -45,7 +46,7 @@ class AuthService(BaseServiceClient):
             response = self._post("/auth/login/with-services", payload)
             data = response.json()
             
-            self.logger.debug(f"    📡 Login response: {data}")
+            self.logger.debug(f"    📡 Login response: {redact_secrets(data)}")
             
             token = data.get('token') or data.get('access_token') or data.get('jwt')
             refresh_token = data.get('refresh_token') or data.get('refreshToken')
@@ -124,7 +125,7 @@ class AuthService(BaseServiceClient):
             response = self._post("/auth/refresh", payload)
             data = response.json()
 
-            self.logger.debug(f"    📡 Refresh response: {data}")
+            self.logger.debug(f"    📡 Refresh response: {redact_secrets(data)}")
 
             token = data.get('access_token') or data.get('token') or data.get('jwt')
             if not token:
@@ -172,7 +173,7 @@ class AuthService(BaseServiceClient):
             response = self._post("/auth/api-key", payload)
             data = response.json()
 
-            self.logger.debug(f"    📡 API-key auth response: {data}")
+            self.logger.debug(f"    📡 API-key auth response: {redact_secrets(data)}")
 
             token = data.get('token') or data.get('access_token') or data.get('jwt')
 
@@ -196,6 +197,109 @@ class AuthService(BaseServiceClient):
         """Compatibility wrapper returning only the API-key access token."""
         session = self.authenticate_api_key_session(api_key)
         return session.get("access_token") if session else None
+
+    # ------------------------------------------------------------------
+    # Status-preserving credential calls.
+    #
+    # The `*_session` methods above collapse every failure into None — a
+    # DNS failure, a 5xx, a 401 and the structured `409 chain_not_allowed`
+    # a connector key gets for a chain outside its `allowed_chains` all
+    # look the same. Callers that must tell those apart (the `yf` CLI's
+    # exit table: 4 = credential rejected, 1 = platform refused /
+    # unreachable) use these variants, which never raise and always return
+    #
+    #     {"ok": bool, "status_code": int, "body": Any, "session": dict | None}
+    #
+    # `status_code == 0` means the host was not reached; `session` is the
+    # same normalized bundle the `*_session` methods return, present only
+    # when `ok` is true and a token was minted.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _bundle_from_body(body: Any) -> Optional[dict]:
+        if not isinstance(body, dict):
+            return None
+        token = body.get('token') or body.get('access_token') or body.get('jwt')
+        if not token:
+            return None
+        return {
+            "access_token": token,
+            "refresh_token": body.get('refresh_token') or body.get('refreshToken'),
+            "expires_in": body.get('expires_in') or body.get('expiresIn'),
+            "raw": body,
+        }
+
+    def _credential_result(self, endpoint: str, payload: dict, *, what: str) -> dict:
+        result = self._request_json_safe("POST", endpoint, data=payload)
+        body = result.get("body")
+        self.logger.debug(f"    📡 {what} response ({result.get('status_code')}): {redact_secrets(body)}")
+        session = self._bundle_from_body(body) if result.get("ok") else None
+        if result.get("ok") and session is None:
+            # 2xx without a token is a refusal in disguise, not a session.
+            result = {"ok": False, "status_code": int(result.get("status_code") or 0), "body": body}
+        return {
+            "ok": bool(result.get("ok")) and session is not None,
+            "status_code": int(result.get("status_code") or 0),
+            "body": body,
+            "session": session,
+        }
+
+    def exchange_api_key_session(self, api_key: str) -> dict:
+        """
+        ``POST /auth/api-key`` with the HTTP outcome preserved (see above).
+        A connector key asked for a chain outside its ``allowed_chains``
+        answers ``409 {"error", "code": "chain_not_allowed", "chain_id",
+        "allowed_chains"}`` — surfaced in ``body`` rather than swallowed.
+        """
+        self.logger.info("  🔑 Authenticating with API key")
+        payload = {"api_key": api_key}
+        if self.config.chain_id:
+            payload["chain_id"] = self.config.chain_id
+        return self._credential_result("/auth/api-key", payload, what="API-key auth")
+
+    def refresh_session(self, refresh_token: str, *, chain_id: str) -> dict:
+        """
+        ``POST /auth/refresh`` with the HTTP outcome preserved. The auth
+        service rotates refresh tokens; keep ``session.refresh_token`` when
+        present. A connector lineage refreshed onto a chain outside its
+        binding answers the same ``409 chain_not_allowed`` as the exchange.
+        """
+        self.logger.debug("  🔁 Refreshing access token")
+        payload = {"refresh_token": refresh_token, "chain_id": chain_id}
+        return self._credential_result("/auth/refresh", payload, what="Refresh")
+
+    def login_session_result(self, email: str, password: str) -> dict:
+        """
+        ``POST /auth/login/with-services`` with the HTTP outcome preserved,
+        then — when ``config.chain_id`` is set and the minted session is on
+        another chain — pinned to that chain through ``refresh_session``.
+        The returned envelope is the LAST call's, so a refused pin surfaces
+        with the refresh endpoint's status and body.
+        """
+        self.logger.info(f"  🔐 Logging in user: {email}")
+        payload = {"email": email, "password": password, "services": ["vault", "payments"]}
+        result = self._credential_result("/auth/login/with-services", payload, what="Login")
+        if not result["ok"]:
+            return result
+
+        session = result["session"]
+        target_chain = self.config.chain_id
+        current_chain = extract_claim(session["access_token"], "default_chain_id", "chain_id", "chainId")
+        if target_chain and str(current_chain or "") != target_chain:
+            refresh_token = session.get("refresh_token")
+            if not refresh_token:
+                self.logger.error(
+                    f"    ❌ Login cannot pin the session to chain {target_chain}: no refresh token was returned"
+                )
+                return {
+                    "ok": False,
+                    "status_code": result["status_code"],
+                    "body": {"error": f"the login session is on chain {current_chain} and carries no refresh token to pin it to chain {target_chain}"},
+                    "session": None,
+                }
+            self.logger.info(f"    🔀 Pinning session to chain {target_chain}")
+            return self.refresh_session(refresh_token, chain_id=target_chain)
+        return result
 
     def generate_api_key(
         self,
@@ -933,6 +1037,22 @@ class AuthService(BaseServiceClient):
     # calls. The crypto primitives (generate key / sign message) live
     # in `yieldfabric.utils.crypto`; this class handles only the HTTP.
     # ------------------------------------------------------------------
+
+    def get_jwt_info(self, token: str) -> dict:
+        """
+        GET /protected/jwt — the auth service's own reading of a bearer.
+
+        Returns the ``{ok, status_code, body}`` envelope from
+        ``_request_json_safe`` so callers can tell a rejected token
+        (401/403) from a transport failure (``status_code == 0``). On
+        success ``body`` carries ``user_id``, ``role``, ``acting_as``,
+        ``delegation_scope``, ``account_address``,
+        ``group_account_address``, ``default_wallet_id``,
+        ``default_chain_id``, ``permissions``, ``billing_gate``,
+        ``session_kind`` and ``allowed_chains`` (plus the other echoed
+        claims). Consumers echo ``session_kind`` — they never re-derive it.
+        """
+        return self._request_json_safe("GET", "/protected/jwt", token=token)
 
     def get_user_id_from_profile(self, token: str) -> Optional[str]:
         """

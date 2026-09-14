@@ -20,11 +20,26 @@ tests/
 ├── test_services/         (empty)
 ├── test_utils/            (empty)
 ├── test_validation/       (empty)
+├── test_unit/             ← offline unit tests (unittest.mock only; no backend)
+│   ├── test_yf_*.py       (the `yf` command-line client: settings, session,
+│   │                       settlement classifier, one test per command)
+│   ├── test_redact.py     (credential masking in debug logs)
+│   └── yf_helpers.py      (shared fixtures for those)
 └── test_e2e/              ← all flow tests live here
     ├── __init__.py
     ├── conftest.py        (SEEDED_USERS, provision_user, config fixture)
     └── test_*.py          (one file per flow)
 ```
+
+### `test_unit/`
+
+Offline. Service methods are replaced with `unittest.mock` objects (there
+is no requests-mock / responses dependency), the `yf` session file is
+redirected into `tmp_path` via `YF_CONFIG_DIR`, and stdout/stderr are
+captured with `capsys`. Run with `make test-unit` — it puts `.:..` on
+`PYTHONPATH` because `test_manual_signature_attempt.py` imports the sibling
+`loan_management` package from the `yieldfabric-docs` checkout; a bare
+`pytest tests/test_unit` errors at collection on that file.
 
 ### `test_e2e/conftest.py`
 

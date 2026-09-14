@@ -61,8 +61,194 @@ yieldfabric/
 
 ```bash
 cd yieldfabric-docs/python
-pip install -e .
+pip install -e .          # distribution `yieldfabric-cli`, import package `yieldfabric`
 ```
+
+This installs two console scripts from one package:
+
+| Script | What it is |
+|---|---|
+| `yf` | the command-line client — one operation per invocation, `--json` for scripts and agents (below) |
+| `yieldfabric` | the YAML command-file runner / setup harness (the rest of this README) |
+
+## `yf` — command-line client
+
+`yf` is a thin front end over the service clients in `yieldfabric/services/`
+(auth, payments, agents). It talks to the production hosts by default, reads
+its configuration from `YF_*` environment variables and flags only, and never
+picks up a `.env` from the current directory (pass `--env-file` explicitly if
+you keep one).
+
+```bash
+yf login --email you@example.com                 # password prompted; session stored
+yf whoami                                        # who am I, which chain, which wallet
+yf balance --asset USDx
+yf send --asset USDx --amount 12.50 --to-wallet <their wallet id> --wait   # human-readable amount; converted to base units exactly
+yf accept-all --asset USDx --wait
+yf obligation create --asset USDx --counterpart-wallet <wallet id> --wait   # → contract_id, acceptable: true
+yf obligation accept --contract CONTRACT-OBLIGATION-… --wait
+yf settle <message_id>                           # wait for one submission, print its state
+yf group delegate --group "Treasury" --ttl 1800  # delegation JWT → export YF_TOKEN=…
+yf kg count --workspace <working_group_id> --term "ACN 123 456 789"
+yf kg retrieve --workspace <working_group_id> --query "rent review clause"
+yf --json …                                      # any command, machine-readable (`yf whoami --json` works too)
+```
+
+Run `yf --help` and `yf <command> --help` for every flag; `make yf-help`
+shows the same without installing.
+
+#### Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `YF_API_KEY` | – | a `yf_api_…` key; exchanged for a session on every invocation (`--api-key`) |
+| `YF_TOKEN` | – | a raw bearer used as-is, e.g. a delegation JWT (`--token`) |
+| `YF_CHAIN` | `153` | chain id (`--chain`). `153` is the public **test** chain, `151` is **live** |
+| `YF_AUTH_URL` | `https://auth.yieldfabric.com` | auth host (`--auth-url`) |
+| `YF_PAYMENTS_URLS` | `{"153": "https://pay.test.yieldfabric.com", "151": "https://pay.live.yieldfabric.com"}` | JSON object `{chain_id: url}`, merged over the defaults; the payments host is chosen by the resolved chain (`--payments-url` overrides for that chain) |
+| `YF_AGENTS_URL` | `https://agents.yieldfabric.com` | agents host, used by `kg …` (`--agents-url`) |
+| `YF_CONFIG_DIR` | `~/.config/yf` | where `session.json` lives |
+| `YF_TIMEOUT` | `30` | HTTP timeout in seconds (`--timeout`) |
+| `YF_PASSWORD` | – | password for `yf login --email` (avoids putting it in argv) |
+| `YF_DEBUG` | – | `1` = verbose request logging on stderr (`--debug`). Credentials in logged responses are masked (`***redacted***`), but treat debug output as sensitive: do not capture it into shared or CI logs |
+
+Chain precedence: `--chain` > `YF_CHAIN` > the bearer's own chain when
+`--token` is used > the chain of the stored login > `153`. Whatever the source,
+the session must have been minted for that chain — a session for another chain
+is refused up front (`chain_mismatch`, exit 2) because the payments host would
+reject it anyway.
+
+#### Credentials and the session file
+
+Resolution order: `--token`/`YF_TOKEN` → `--api-key`/`YF_API_KEY` (stateless,
+exchanged per call) → the session stored by `yf login`. `yf login` writes
+`$YF_CONFIG_DIR/session.json` (mode `0600`, one record per auth host) holding
+the access and refresh token; an access token within 60 s of expiry is renewed
+through the refresh endpoint and, because refresh tokens are single-use, the
+rotated pair is written back before the command runs. `yf logout` deletes the
+record. Tokens are never printed unless `--json --show-tokens` is passed to
+`login`.
+
+Credential failures keep the platform's answer rather than collapsing into
+one generic refusal: a rejected key, password or refresh token is exit `4`
+with the server's reason and `http_status`; a connector key (or a session
+minted from one) asked for a chain outside its `allowed_chains` is exit `1`
+with `code: chain_not_allowed` and the allowed chains in the message; an
+auth host that could not be reached is exit `1` with `code: unreachable`.
+
+**Saved delegations.** `yf group delegate --save` stores the delegation
+JWT *beside* the personal login for the auth host (under `delegation` in
+the same record), never over it, and it becomes the active session until
+it expires. Delegations are not refreshable: once expired, commands fail
+with `delegation_expired` (exit 4) and the remedy is `yf group delegate
+--save` again — or `yf logout --delegation`, which drops only the saved
+delegation and returns you to the personal login. A fresh `yf login`
+replaces the whole record, delegation included.
+
+**Personal vs connector keys.** `POST /auth/api-key/generate` mints a
+*personal* key by default; a `kind: connector` key (the kind the MCP
+connectors take) mints a session that can read but cannot submit chain work
+or mint delegations. `yf` reads `session_kind` from the session and refuses
+`send`, `accept-all`, `obligation …` and `group delegate` under a connector
+session with `connector_cannot_write` (exit 4) rather than surfacing a bare
+`403`. `whoami`, `balance`, `settle` and `kg …` work with either kind.
+
+#### `--live`
+
+Chain `151` moves real value. Any command resolved to chain `151` refuses
+to run without `--live` (`live_requires_flag`, exit 2), checked before any
+request is sent. The guard keys on the payments **host** as well as the
+chain: pointing any chain at `pay.live.yieldfabric.com` — or at a host that
+`YF_PAYMENTS_URLS` maps to a live chain — through `--payments-url` or
+`YF_PAYMENTS_URLS` also needs `--live`. Commands that never touch payments
+(`kg …`, `version`, `logout`) skip the guard. This is a guard against
+accidents, not what protects the funds: the platform still requires a
+session minted for that chain and, for connector keys, a key allowed on it.
+
+#### `--json` contract
+
+With `--json` (before the command or after it — `--live` likewise),
+stdout carries exactly one JSON document and every log line goes to stderr. Success:
+
+```json
+{"ok": true, "command": "send", "chain_id": "153", "mode": "TEST", "data": {"message_id": "…", "payment_id": "…", "idempotency_key": "…"}}
+```
+
+Failure (also on stdout):
+
+```json
+{"ok": false, "command": "send", "chain_id": "153", "error": {"code": "live_requires_flag", "message": "…", "http_status": 403, "details": {}}}
+```
+
+`command`, `chain_id`/`mode` (absent for commands that are not chain-scoped:
+`kg …`, `version`, `logout`) and `error.code` are stable. Without `--json`
+the result is printed as flat `key: value` lines on stdout and errors as a
+single `error [code]: …` line on stderr.
+
+| Exit | Meaning |
+|---|---|
+| `0` | ok |
+| `1` | the platform answered and refused, or the operation reported failure (GraphQL errors, `success: false`, HTTP 4xx/5xx other than auth, `message_not_found`, `chain_not_allowed`), or a host could not be reached (`unreachable`) |
+| `2` | usage / configuration: missing credential, unknown chain, live guard, chain mismatch, bad flags, `bad_message_id` |
+| `3` | a wait ran out (`settle`, `--wait`) — the last observed state is in `error.details` |
+| `4` | credential rejected (401/403, before **or during** a wait), exchange or login failed, expired saved delegation, or the session cannot perform the operation (connector) |
+| `5` | the operation reached the chain and failed there (`state: failed`) |
+
+#### Settlement: `executed` ≠ settled
+
+Every submission (`send`, `accept-all`, `obligation …`) returns a
+`message_id` as soon as the platform has accepted it. `yf settle <message_id>`
+(and `--wait` on the submitting command) polls the operation's status and
+reports one of:
+
+| `state` | Meaning |
+|---|---|
+| `pending` | not executed yet — or a chain failure not yet recorded as final |
+| `executed` | the chain transaction landed; the resulting records are still being written — do not read them yet |
+| `settled` | the records are readable (final) |
+| `failed` | the chain step failed and the failure is recorded (final) |
+
+The output mirrors the payments MCP `wait_for_settlement` tool
+(`message_id, state, executed_at, post_processed_at, error, retry_after_s,
+lifecycle_status, post_processing_error_kind, timed_out`) plus `attempts`
+and `elapsed`. `obligation create --wait` reports `acceptable: true` only
+once settled — that is when `obligation accept` can find the contract.
+`accept-all --wait` polls every returned message id and exits `5` if any
+failed, `3` if any is still not settled when the wait runs out.
+
+The first read of a wait is decisive: an id the platform does not know for
+this session's entity is `message_not_found` (exit 1) immediately, with or
+without `--no-wait`, and a rejected bearer is exit 4 — neither spins for
+the timeout. A bearer that stops being accepted *during* a wait (an
+expired delegation, a revoked key) aborts the wait with exit 4 after two
+consecutive refusals.
+
+Idempotency: every submission carries a fresh UUIDv4 `idempotencyKey`
+(printed as `idempotency_key`). Pass `--idempotency-key` only to re-submit
+the *same* operation; a reused key hands back the earlier submission instead
+of a new one.
+
+#### Knowledge (`kg`)
+
+`kg count` is exhaustive — a tally per term, never a rank; a `*_capped`
+tally is a floor and the command says so in `warning`. `--mode exact` (the
+default) does no stemming (names, identifiers, clause numbers); `phrase`
+stems; `fuzzy` is a substring scan and must not be presented as a finding.
+`kg retrieve` is ranked (passages with citations, no synthesis); when
+`lanes.any_degraded` is true the results are partial and `--effort hard`
+re-runs with a larger budget. Both take `--workspace <working_group_id>`
+and use the same bearer as everything else. Knowledge is not chain-scoped:
+only the agents host is called, the envelope carries no `chain_id`/`mode`,
+the live guard does not run, and no payments host is needed for the
+resolved chain.
+
+Tests for the client live in `tests/test_unit/test_yf_*.py`
+(`make test-unit`); they mock the service methods and never touch the
+network.
+
+---
+
+## `yieldfabric` — YAML command runner and setup harness
 
 ### Deploy assets from a setup.yaml (port of `setup_system.sh`)
 
@@ -388,15 +574,19 @@ config = YieldFabricConfig.from_dict(config_dict)
 ## 🧪 Testing
 
 ```bash
-# Run tests
-pytest
+# Offline unit tests (incl. the yf client) — no backend needed
+make test-unit                      # PYTHON=/usr/bin/python3 if your default python3 lacks pytest
+
+# Everything (E2E flows skip themselves when no backend is reachable)
+make test
 
 # With coverage
-pytest --cov=yieldfabric --cov-report=html
-
-# Run specific test
-pytest tests/test_executors/test_payment_executor.py
+make test-coverage
 ```
+
+`make test*` puts `.:..` on `PYTHONPATH`: one unit test imports the sibling
+`loan_management` package from the `yieldfabric-docs` checkout, so a bare
+`pytest` from this directory errors at collection.
 
 ## 🔍 Debugging
 
